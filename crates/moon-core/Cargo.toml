@@ -7,3 +7,19 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+test-util = []
+
+[dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rust_decimal_macros.workspace = true
+toml.workspace = true
+proptest.workspace = true

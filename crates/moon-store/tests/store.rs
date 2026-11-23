@@ -402,10 +402,10 @@ fn newer_schema_version_is_rejected() {
 #[test]
 fn apply_paper_fill_persists_account_and_state() {
     let mut s = Store::open_in_memory().unwrap();
-    let mut a = PaperAccount::default();
-    a.cash_ars = rust_decimal_macros::dec!(123.45);
-    a.positions
-        .insert("SPY".into(), rust_decimal_macros::dec!(2));
+    let a = PaperAccount {
+        cash_ars: dec!(123.45),
+        positions: BTreeMap::from([("SPY".to_string(), dec!(2))]),
+    };
     s.apply_paper_fill(&a, "paper_order:k", &serde_json::json!({"x": 1}))
         .unwrap();
     assert_eq!(s.paper_account().unwrap(), a);

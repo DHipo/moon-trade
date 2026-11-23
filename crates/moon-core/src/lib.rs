@@ -2,10 +2,12 @@
 
 pub mod allocator;
 pub mod asset;
+pub mod backtest;
 pub mod bars;
 pub mod error;
 pub mod fees;
 pub mod indicators;
+pub mod metrics;
 pub mod money;
 pub mod nav;
 pub mod rebalance;

@@ -7,3 +7,24 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+moon-core.workspace = true
+moon-store.workspace = true
+moon-iol.workspace = true
+moon-yahoo.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+rust_decimal.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+tokio.workspace = true
+rust_decimal_macros.workspace = true
+moon-core = { workspace = true, features = ["test-util"] }

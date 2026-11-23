@@ -7,3 +7,17 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+moon-core.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+tokio.workspace = true

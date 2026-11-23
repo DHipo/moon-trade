@@ -22,7 +22,7 @@
 - Never log or `Debug`-print secrets (IOL password, tokens, Telegram bot token). Implement `Debug` manually with `"***"` where a struct holds one.
 - No test touches the network: HTTP through `wiremock`, SQLite in memory or in `tempfile` dirs.
 - Time zone for scheduling and for dates derived from IOL timestamps: `America/Argentina/Buenos_Aires` (`moon_core::time::ART`).
-- Every task ends green on: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`. Then commit with the given message (append the line `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`) and `git push`.
+- Every task ends green on: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`. Then commit with the given message (end the message with the line `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`) and `git push`.
 
 ## Review Focus
 

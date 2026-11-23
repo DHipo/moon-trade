@@ -128,6 +128,11 @@ pub fn run_backtest(input: &BacktestInput<'_>) -> Result<BacktestResult, CoreErr
     let universe = input.universe;
     input.risk.validate()?;
     cfg.fees.validate()?;
+    if cfg.monthly_contribution < Decimal::ZERO {
+        return Err(CoreError::InvalidConfig(
+            "el aporte mensual debe ser >= 0".into(),
+        ));
+    }
     if cfg.initial_capital <= Decimal::ZERO {
         return Err(CoreError::InvalidConfig(
             "el capital inicial debe ser > 0".into(),
@@ -222,7 +227,11 @@ pub fn run_backtest(input: &BacktestInput<'_>) -> Result<BacktestResult, CoreErr
     let mut emergency_exits: Vec<NaiveDate> = Vec::new();
 
     for (i, &date) in calendar.iter().enumerate() {
-        let mut flow = Decimal::ZERO;
+        let mut flow = if i == 0 {
+            cfg.initial_capital
+        } else {
+            Decimal::ZERO
+        };
         let first_of_month = i == 0 || {
             let p = calendar[i - 1];
             (p.year(), p.month()) != (date.year(), date.month())
@@ -230,7 +239,7 @@ pub fn run_backtest(input: &BacktestInput<'_>) -> Result<BacktestResult, CoreErr
 
         let (targets, reason, force_full) = if first_of_month {
             if i > 0 && cfg.monthly_contribution != Decimal::ZERO {
-                flow = cfg.monthly_contribution;
+                flow += cfg.monthly_contribution;
                 tracker.apply_flow(flow, prev_equity);
                 cash += flow;
             }
@@ -324,7 +333,9 @@ pub fn run_backtest(input: &BacktestInput<'_>) -> Result<BacktestResult, CoreErr
         if refuge.is_cash() {
             refuge_value = cash;
         }
-        let nav = tracker.nav(equity).unwrap_or(0.0);
+        let nav = tracker
+            .nav(equity)
+            .ok_or_else(|| missing("no hay unidades de NAV para valuar la cartera"))?;
         if drawdown.observe(nav, date, input.risk.max_drawdown) == DrawdownSignal::Tripped {
             pending_emergency = true;
         }
@@ -378,6 +389,7 @@ mod tests {
     use super::*;
     use crate::allocator::{AllocationConfig, SizingKind, StrategyConfig};
     use crate::asset::Role;
+    use crate::bars::Bar;
     use crate::testutil::{d, daily_series, spec};
     use rust_decimal_macros::dec;
 
@@ -468,22 +480,37 @@ mod tests {
 
     #[test]
     fn decisions_never_use_future_data() {
-        let series = series_a(&rising(900));
-        let res = run(&config(), &series, false).unwrap();
-        assert!(!res.decisions.is_empty());
-        for dec in &res.decisions {
-            let first_trade = res
-                .trades
+        let cutoff = d(2024, 3, 15);
+        let full = series_a(&rising(900));
+        let mut tampered = BTreeMap::new();
+        for (id, s) in &full {
+            let bars: Vec<Bar> = s
+                .bars()
                 .iter()
-                .find(|t| t.date > dec.as_of)
-                .map(|t| t.date);
-            if let Some(t) = first_trade {
-                assert!(dec.as_of < t);
-            }
+                .map(|b| {
+                    let mut b = b.clone();
+                    if b.date >= cutoff {
+                        b.open *= 10.0;
+                        b.high *= 10.0;
+                        b.low *= 10.0;
+                        b.close *= 10.0;
+                        b.adj_close *= 10.0;
+                    }
+                    b
+                })
+                .collect();
+            tampered.insert(id.clone(), PriceSeries::new(bars).unwrap());
         }
-        // The first trade executes strictly after the first decision's as_of.
-        let t0 = res.trades[0].date;
-        assert!(res.decisions[0].as_of < t0);
+        let a = run(&config(), &full, false).unwrap();
+        let b = run(&config(), &tampered, false).unwrap();
+        let da: Vec<_> = a.decisions.iter().filter(|x| x.as_of < cutoff).collect();
+        let db: Vec<_> = b.decisions.iter().filter(|x| x.as_of < cutoff).collect();
+        assert!(da.len() > 3);
+        assert_eq!(da, db);
+        let ta: Vec<_> = a.trades.iter().filter(|t| t.date < cutoff).collect();
+        let tb: Vec<_> = b.trades.iter().filter(|t| t.date < cutoff).collect();
+        assert!(!ta.is_empty());
+        assert_eq!(ta, tb);
     }
 
     #[test]
@@ -514,7 +541,19 @@ mod tests {
         }
         let last = res.equity_curve.last().unwrap();
         assert!(last.equity > dec!(10000));
-        assert!(res.metrics.net_contributions > dec!(10000));
+        let n = res
+            .equity_curve
+            .iter()
+            .skip(1)
+            .filter(|p| p.flow > dec!(0))
+            .count();
+        assert!(n > 10);
+        assert_eq!(res.equity_curve[0].flow, dec!(10000));
+        assert_eq!(
+            res.metrics.net_contributions,
+            dec!(10000) + dec!(100) * Decimal::from(n)
+        );
+        assert_eq!(last.equity, res.metrics.net_contributions);
     }
 
     #[test]
@@ -522,12 +561,21 @@ mod tests {
         let n = 900;
         let probe = daily_series(d(2022, 1, 3), &vec![1.0; n]);
         let crash_date = d(2023, 8, 16);
+        let recover_date = d(2023, 9, 5);
         let base = rising(n);
         let closes: Vec<f64> = probe
             .bars()
             .iter()
             .zip(base)
-            .map(|(b, c)| if b.date >= crash_date { c * 0.7 } else { c })
+            .map(|(b, c)| {
+                if b.date >= recover_date {
+                    c * 1.05
+                } else if b.date >= crash_date {
+                    c * 0.7
+                } else {
+                    c
+                }
+            })
             .collect();
         let series = series_a(&closes);
         let res = run(&config(), &series, false).unwrap();
@@ -542,6 +590,12 @@ mod tests {
                 .all(|t| t.reason == OrderReason::Emergency && t.side == Side::Sell)
         );
         assert!(res.decisions.iter().any(|dc| dc.as_of >= ex));
+        // The next monthly rebalance re-evaluates normally and buys back in.
+        assert!(
+            res.trades
+                .iter()
+                .any(|t| t.date > ex && t.reason == OrderReason::Monthly && t.side == Side::Buy)
+        );
     }
 
     #[test]
@@ -557,9 +611,33 @@ mod tests {
 
     #[test]
     fn insufficient_history_errors() {
+        // Start lies inside the data, so only the warmup rule can fail.
+        let mut cfg = config();
+        cfg.start = d(2022, 1, 3);
         let series = series_a(&rising(65));
-        let err = run(&config(), &series, false).unwrap_err();
+        let err = run(&cfg, &series, false).unwrap_err();
         assert!(matches!(err, CoreError::MissingData(_)), "{err:?}");
+    }
+
+    #[test]
+    fn warmup_just_satisfied_runs() {
+        // Faber 10m needs 11 monthly closes: Jan..Oct plus the partial Nov (bar on 11-01) precede 11-02.
+        let mut cfg = config();
+        cfg.start = d(2022, 1, 3);
+        let series = series_a(&rising(900));
+        let res = run(&cfg, &series, false).unwrap();
+        assert_eq!(res.start, d(2022, 11, 2));
+    }
+
+    #[test]
+    fn invalid_contribution_is_rejected() {
+        let mut cfg = config();
+        cfg.monthly_contribution = dec!(-1);
+        let series = series_a(&rising(900));
+        assert!(matches!(
+            run(&cfg, &series, false),
+            Err(CoreError::InvalidConfig(_))
+        ));
     }
 
     #[test]

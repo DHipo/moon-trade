@@ -156,7 +156,7 @@ pub fn compute_metrics(points: &[EquityPoint], trades: &[Trade], risk_free_rate:
         0.0
     };
     m.final_equity = points[points.len() - 1].equity;
-    m.net_contributions = points[0].equity + points.iter().map(|p| p.flow).sum::<Decimal>();
+    m.net_contributions = points.iter().map(|p| p.flow).sum::<Decimal>();
     m
 }
 

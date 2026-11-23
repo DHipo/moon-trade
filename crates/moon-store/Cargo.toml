@@ -7,3 +7,18 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+moon-core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rust_decimal_macros.workspace = true
+moon-core = { workspace = true, features = ["test-util"] }

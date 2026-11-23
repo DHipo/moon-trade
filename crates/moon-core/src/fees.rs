@@ -3,6 +3,7 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::error::CoreError;
 use crate::money::round_money;
 
 /// Fee rates as fractions (0.006 = 0.6 %).
@@ -31,6 +32,25 @@ impl FeeModel {
             vat_rate: Decimal::ZERO,
             min_commission: Decimal::ZERO,
         }
+    }
+
+    /// Rates must be fractions in `[0, 1)`; the minimum commission must be `>= 0`.
+    pub fn validate(&self) -> Result<(), CoreError> {
+        let rate_ok = |r: Decimal| r >= Decimal::ZERO && r < Decimal::ONE;
+        if !rate_ok(self.commission_rate)
+            || !rate_ok(self.market_fee_rate)
+            || !rate_ok(self.vat_rate)
+        {
+            return Err(CoreError::InvalidConfig(
+                "las tasas de comisión deben estar en [0, 1)".into(),
+            ));
+        }
+        if self.min_commission < Decimal::ZERO {
+            return Err(CoreError::InvalidConfig(
+                "min_commission debe ser >= 0".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn breakdown(&self, trade_value: Decimal) -> FeeBreakdown {
@@ -79,6 +99,19 @@ mod tests {
         assert_eq!(b.vat, dec!(12.60));
         assert_eq!(b.market_fee, dec!(8.00));
         assert_eq!(b.total, dec!(80.60));
+    }
+
+    #[test]
+    fn fee_model_validate() {
+        assert!(model(dec!(0)).validate().is_ok());
+        assert!(FeeModel::zero().validate().is_ok());
+        let mut m = model(dec!(0));
+        m.commission_rate = dec!(1);
+        assert!(m.validate().is_err());
+        let mut m = model(dec!(0));
+        m.vat_rate = dec!(-0.1);
+        assert!(m.validate().is_err());
+        assert!(model(dec!(-1)).validate().is_err());
     }
 
     #[test]

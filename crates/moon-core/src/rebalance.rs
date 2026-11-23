@@ -125,6 +125,12 @@ pub fn plan_rebalance(input: &RebalanceInput<'_>) -> Result<RebalancePlan, CoreE
         ));
     }
 
+    if !(p.slippage_rate >= Decimal::ZERO && p.slippage_rate < Decimal::new(5, 1)) {
+        return Err(CoreError::InvalidConfig(
+            "slippage_rate debe estar en [0, 0.5)".into(),
+        ));
+    }
+
     // Assets to consider: held or targeted, excluding CASH.
     let mut universe: BTreeSet<&AssetId> = BTreeSet::new();
     for (id, q) in input.holdings {
@@ -219,6 +225,10 @@ pub fn plan_rebalance(input: &RebalanceInput<'_>) -> Result<RebalancePlan, CoreE
             } else {
                 qty_held.min(floor_to_lot((cur - tgt) / price, lot))
             };
+            if exec <= Decimal::ZERO {
+                skipped.push(skip(SkipReason::BelowMinTrade));
+                continue;
+            }
             if qty <= Decimal::ZERO {
                 skipped.push(skip(SkipReason::LotRounding));
                 continue;
@@ -229,6 +239,11 @@ pub fn plan_rebalance(input: &RebalanceInput<'_>) -> Result<RebalancePlan, CoreE
                 continue;
             }
             let fees = input.fees.total(value);
+            // Dust: fees eat the whole sale (applies to full exits too); keep it and report it.
+            if fees >= value {
+                skipped.push(skip(SkipReason::BelowMinTrade));
+                continue;
+            }
             proceeds += value - fees;
             sells.push(PlannedOrder {
                 asset: id.clone(),
@@ -241,6 +256,10 @@ pub fn plan_rebalance(input: &RebalanceInput<'_>) -> Result<RebalancePlan, CoreE
             });
         } else {
             let exec = round_price(price * (Decimal::ONE + p.slippage_rate));
+            if exec <= Decimal::ZERO {
+                skipped.push(skip(SkipReason::BelowMinTrade));
+                continue;
+            }
             let qty = floor_to_lot((tgt - cur) / exec, lot);
             if qty <= Decimal::ZERO {
                 skipped.push(skip(SkipReason::LotRounding));
@@ -304,9 +323,10 @@ pub fn plan_rebalance(input: &RebalanceInput<'_>) -> Result<RebalancePlan, CoreE
     }
 
     let est_cash_after = budget - total_cost(&buys);
+    // Unreachable: every emitted sell has positive net proceeds and buys fit the budget.
     if est_cash_after < Decimal::ZERO {
         return Err(CoreError::InvalidConfig(
-            "las comisiones de las ventas superan el efectivo disponible".into(),
+            "el plan dejaría el efectivo en negativo".into(),
         ));
     }
 
@@ -575,6 +595,56 @@ mod tests {
         );
         let spent: Decimal = plan.buys().iter().map(|o| o.est_value + o.est_fees).sum();
         assert!(spent <= dec!(1000));
+        assert_eq!(plan.buys().len(), 1);
+        assert_eq!(plan.buys()[0].asset, id("SPY"));
+        assert_eq!(plan.buys()[0].qty, dec!(2));
+    }
+
+    #[test]
+    fn force_full_exit_with_tiny_position_and_high_min_commission() {
+        let prices = map(&[("BIG", dec!(100)), ("TINY", dec!(1))]);
+        let holdings = map(&[("BIG", dec!(100)), ("TINY", dec!(3))]);
+        let fees = FeeModel {
+            commission_rate: dec!(0.006),
+            market_fee_rate: dec!(0.0008),
+            vat_rate: dec!(0.21),
+            min_commission: dec!(50),
+        };
+        let mut p = params();
+        p.force_full = true;
+        let plan = run(
+            dec!(0),
+            &holdings,
+            &prices,
+            &BTreeMap::new(),
+            &targets(&[("CASH", 1.0)]),
+            &fees,
+            &p,
+        )
+        .unwrap();
+        assert_eq!(plan.sells().len(), 1);
+        assert_eq!(plan.sells()[0].asset, id("BIG"));
+        assert!(plan.skipped.iter().any(|s| s.asset == id("TINY")
+            && s.side == Side::Sell
+            && s.reason == SkipReason::BelowMinTrade));
+        assert!(plan.est_cash_after >= dec!(0));
+    }
+
+    #[test]
+    fn invalid_slippage_is_error() {
+        let prices = map(&[("A", dec!(1))]);
+        let mut p = params();
+        p.slippage_rate = dec!(0.5);
+        let r = run(
+            dec!(1),
+            &BTreeMap::new(),
+            &prices,
+            &BTreeMap::new(),
+            &targets(&[("A", 1.0)]),
+            &FeeModel::zero(),
+            &p,
+        );
+        assert!(matches!(r, Err(CoreError::InvalidConfig(_))));
     }
 
     #[test]
@@ -605,7 +675,8 @@ mod tests {
     proptest! {
         #[test]
         fn plan_invariants(
-            cash in 0u32..1_000_000,
+            cash in prop_oneof![Just(0u32), 0u32..100, 0u32..1_000_000],
+            force_full in any::<bool>(),
             assets in prop::collection::vec(
                 (1u32..1000, 0u32..500, 0.0f64..1.0, prop::sample::select(vec![1u32, 5, 10])),
                 1..=4,
@@ -648,15 +719,11 @@ mod tests {
                 min_trade_value: Decimal::from(min_trade),
                 cash_buffer: buffer,
                 slippage_rate: Decimal::new(i64::from(slip), 4),
-                force_full: false,
+                force_full,
             };
             let cash = Decimal::from(cash);
-            let plan = match run(cash, &holdings, &prices, &lots, &t, &fees, &p) {
-                Ok(p) => p,
-                // Sell fees can exceed available cash; that is reported, not overspent.
-                Err(CoreError::InvalidConfig(_)) => return Ok(()),
-                Err(e) => return Err(TestCaseError::fail(format!("{e}"))),
-            };
+            let plan = run(cash, &holdings, &prices, &lots, &t, &fees, &p)
+                .map_err(|e| TestCaseError::fail(format!("plan must be Ok: {e}")))?;
             prop_assert!(plan.est_cash_after >= Decimal::ZERO);
             let buy_cost: Decimal = plan.buys().iter().map(|o| o.est_value + o.est_fees).sum();
             let sell_net: Decimal = plan.sells().iter().map(|o| o.est_value - o.est_fees).sum();
@@ -668,8 +735,12 @@ mod tests {
                 if o.side == Side::Sell {
                     prop_assert!(o.qty <= held);
                 }
-                // Full exits sell the whole holding, which need not be a lot multiple.
-                let full_exit = o.side == Side::Sell && o.qty == held;
+                // Only full exits (target weight 0) may sell a non-lot-multiple holding.
+                let full_exit =
+                    o.side == Side::Sell && weight_to_dec(t.get(&o.asset)) == Decimal::ZERO;
+                if o.side == Side::Sell {
+                    prop_assert!(o.est_value > o.est_fees);
+                }
                 prop_assert!(full_exit || o.qty % lot == Decimal::ZERO);
                 prop_assert!(held > Decimal::ZERO || t.get(&o.asset) > 0.0);
             }

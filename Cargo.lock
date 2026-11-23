@@ -939,6 +939,19 @@ dependencies = [
 [[package]]
 name = "moon-iol"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "moon-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "wiremock",
+]
 
 [[package]]
 name = "moon-store"

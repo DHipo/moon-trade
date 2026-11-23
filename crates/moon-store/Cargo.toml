@@ -20,5 +20,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rusqlite.workspace = true
 rust_decimal_macros.workspace = true
 moon-core = { workspace = true, features = ["test-util"] }

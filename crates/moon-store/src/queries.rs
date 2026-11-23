@@ -272,6 +272,12 @@ impl Store {
 
     fn migrate(&mut self) -> Result<(), StoreError> {
         let current = self.schema_version()? as usize;
+        if current > MIGRATIONS.len() {
+            return Err(StoreError::Corrupt(format!(
+                "la base es de una versión más nueva (esquema {current}, soportado {})",
+                MIGRATIONS.len()
+            )));
+        }
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(current) {
             let tx = self.conn.transaction()?;
             tx.execute_batch(sql)?;
@@ -381,7 +387,7 @@ impl Store {
             })
             .optional()?;
         match raw {
-            Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+            Some(s) => Ok(Some(dec_json(&s)?)),
             None => Ok(None),
         }
     }
@@ -463,8 +469,8 @@ impl Store {
     pub fn insert_order(&mut self, o: &OrderRecord) -> Result<bool, StoreError> {
         let n = self.conn.execute(
             &format!(
-                "INSERT OR IGNORE INTO orders ({ORDER_COLS}) VALUES \
-                 (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
+                "INSERT INTO orders ({ORDER_COLS}) VALUES \
+                 (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20) \n                 ON CONFLICT(id) DO NOTHING"
             ),
             params![
                 o.id.to_string(),
@@ -494,7 +500,7 @@ impl Store {
 
     /// Overwrites the mutable fields of an existing order.
     pub fn update_order(&mut self, o: &OrderRecord) -> Result<(), StoreError> {
-        self.conn.execute(
+        let n = self.conn.execute(
             "UPDATE orders SET updated_at = ?2, status = ?3, broker_order_id = ?4, \
              filled_qty = ?5, avg_fill_price = ?6, fees = ?7, fees_estimated = ?8, \
              error = ?9, qty = ?10, limit_price = ?11 WHERE id = ?1",
@@ -512,6 +518,9 @@ impl Store {
                 o.limit_price.map(|d| d.to_string()),
             ],
         )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("no existe la orden {}", o.id)));
+        }
         Ok(())
     }
 
@@ -624,18 +633,24 @@ impl Store {
         status: ProposalStatus,
         at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        self.conn.execute(
+        let n = self.conn.execute(
             "UPDATE proposals SET status = ?2, decided_at = ?3 WHERE id = ?1",
             params![id.to_string(), status.as_str(), enc_ts(at)],
         )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("no existe la propuesta {id}")));
+        }
         Ok(())
     }
 
     pub fn set_proposal_message(&mut self, id: Uuid, message_id: i64) -> Result<(), StoreError> {
-        self.conn.execute(
+        let n = self.conn.execute(
             "UPDATE proposals SET telegram_message_id = ?2 WHERE id = ?1",
             params![id.to_string(), message_id],
         )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("no existe la propuesta {id}")));
+        }
         Ok(())
     }
 
@@ -656,8 +671,8 @@ impl Store {
     /// Returns `false` when `external_id` was already stored.
     pub fn insert_flow(&mut self, f: &FlowRecord) -> Result<bool, StoreError> {
         let n = self.conn.execute(
-            "INSERT OR IGNORE INTO flows (at, mode, kind, amount_ars, external_id, note) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO flows (at, mode, kind, amount_ars, external_id, note) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(external_id) DO NOTHING",
             params![
                 enc_ts(f.at),
                 f.mode.as_str(),

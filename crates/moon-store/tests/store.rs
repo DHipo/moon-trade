@@ -338,11 +338,63 @@ fn backtest_registry_counts_distinct_hashes() {
 fn corrupt_value_is_reported() {
     let mut s = Store::open_in_memory().unwrap();
     s.set_state("k", &1).unwrap();
-    assert!(s.get_state::<String>("k").is_err());
+    assert!(matches!(
+        s.get_state::<String>("k"),
+        Err(StoreError::Corrupt(_))
+    ));
 }
 
 #[test]
 fn store_is_send() {
     fn assert_send<T: Send>() {}
     assert_send::<Store>();
+}
+
+#[test]
+fn malformed_rows_are_corrupt() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.db");
+    let mut s = Store::open(&path).unwrap();
+    let o = order(OrderStatus::Sent, 1);
+    s.insert_order(&o).unwrap();
+    s.insert_snapshot(&snapshot(dec!(1), dec!(1))).unwrap();
+    drop(s);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute("UPDATE orders SET qty = 'abc'", []).unwrap();
+    raw.execute("UPDATE snapshots SET cash_ars = 'zzz'", [])
+        .unwrap();
+    drop(raw);
+    let s = Store::open(&path).unwrap();
+    assert!(matches!(s.get_order(o.id), Err(StoreError::Corrupt(_))));
+    assert!(matches!(
+        s.latest_snapshot(ExecMode::Paper),
+        Err(StoreError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn updates_on_missing_ids_are_not_found() {
+    let mut s = Store::open_in_memory().unwrap();
+    let o = order(OrderStatus::Sent, 1);
+    assert!(matches!(s.update_order(&o), Err(StoreError::NotFound(_))));
+    let id = Uuid::new_v4();
+    assert!(matches!(
+        s.set_proposal_status(id, ProposalStatus::Approved, ts(1)),
+        Err(StoreError::NotFound(_))
+    ));
+    assert!(matches!(
+        s.set_proposal_message(id, 1),
+        Err(StoreError::NotFound(_))
+    ));
+}
+
+#[test]
+fn newer_schema_version_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("n.db");
+    drop(Store::open(&path).unwrap());
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch("PRAGMA user_version = 99").unwrap();
+    drop(raw);
+    assert!(matches!(Store::open(&path), Err(StoreError::Corrupt(_))));
 }

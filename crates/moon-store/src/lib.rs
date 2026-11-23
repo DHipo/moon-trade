@@ -16,4 +16,6 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("dato corrupto en la base: {0}")]
     Corrupt(String),
+    #[error("{0}")]
+    NotFound(String),
 }

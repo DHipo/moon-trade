@@ -3,7 +3,7 @@ use std::time::Duration;
 use chrono::NaiveDate;
 use moon_yahoo::{YahooClient, YahooError};
 use serde_json::Value;
-use wiremock::matchers::{method, path, path_regex, query_param};
+use wiremock::matchers::{header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const SPY: &str = include_str!("fixtures/chart_spy.json");
@@ -77,6 +77,10 @@ async fn sends_expected_query() {
         .and(query_param("period2", "1704585600"))
         .and(query_param("events", "div,splits"))
         .and(query_param("includeAdjustedClose", "true"))
+        .and(header(
+            "user-agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) moon-trade",
+        ))
         .respond_with(json(SPY))
         .expect(1)
         .mount(&server)
@@ -204,4 +208,23 @@ async fn latest_quote_reads_meta() {
     assert_eq!(q.price, 475.5);
     assert_eq!(q.currency, "USD");
     assert_eq!(q.at.timestamp(), 1_704_832_800);
+}
+
+#[tokio::test]
+async fn slow_server_times_out_after_retries() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(json(SPY).set_delay(Duration::from_secs(1)))
+        .expect(3)
+        .mount(&server)
+        .await;
+    let err = client(&server)
+        .with_timeout(Duration::from_millis(200))
+        .daily_bars("SPY", d(2024, 1, 2), d(2024, 1, 6))
+        .await
+        .expect_err("timeout");
+    match err {
+        YahooError::Http(e) => assert!(e.is_timeout(), "{e:?}"),
+        other => panic!("unexpected {other:?}"),
+    }
 }

@@ -10,6 +10,8 @@ use serde::Deserialize;
 const DEFAULT_BASE_URL: &str = "https://query1.finance.yahoo.com";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) moon-trade";
 const MAX_ATTEMPTS: u32 = 3;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SECS_PER_DAY: i64 = 86_400;
 
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +42,7 @@ pub struct YahooClient {
     base_url: String,
     retry_delay: Duration,
     max_attempts: u32,
+    timeout: Duration,
 }
 
 impl Default for YahooClient {
@@ -116,6 +119,17 @@ fn at(series: &[Option<f64>], i: usize) -> Option<f64> {
     series.get(i).copied().flatten()
 }
 
+fn build_http(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(CONNECT_TIMEOUT.min(timeout))
+        .build()
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not build HTTP client with timeouts, using default");
+            reqwest::Client::new()
+        })
+}
+
 fn day_start_unix(date: NaiveDate) -> i64 {
     date.and_time(chrono::NaiveTime::MIN).and_utc().timestamp()
 }
@@ -127,11 +141,19 @@ impl YahooClient {
 
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: build_http(REQUEST_TIMEOUT),
             base_url: base_url.into(),
             retry_delay: Duration::from_secs(1),
             max_attempts: MAX_ATTEMPTS,
+            timeout: REQUEST_TIMEOUT,
         }
+    }
+
+    /// Overrides the total per-request timeout (default 20 s).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.http = build_http(timeout);
+        self.timeout = timeout;
+        self
     }
 
     pub fn with_retry_delay(mut self, delay: Duration) -> Self {
@@ -173,7 +195,9 @@ impl YahooClient {
             ) else {
                 continue;
             };
-            let date = DateTime::from_timestamp(ts + gmtoffset, 0)
+            let date = ts
+                .checked_add(gmtoffset)
+                .and_then(|t| DateTime::from_timestamp(t, 0))
                 .ok_or_else(|| YahooError::Parse(format!("timestamp fuera de rango: {ts}")))?
                 .date_naive();
             let adj_close = adj.and_then(|a| at(&a.adjclose, i)).unwrap_or(close);
@@ -205,13 +229,13 @@ impl YahooClient {
             .meta
             .regular_market_time
             .ok_or_else(|| YahooError::Parse("falta meta.regularMarketTime".into()))?;
-        let at = DateTime::from_timestamp(secs, 0)
+        let time = DateTime::from_timestamp(secs, 0)
             .ok_or_else(|| YahooError::Parse(format!("timestamp fuera de rango: {secs}")))?;
         Ok(YahooQuote {
             symbol: symbol.to_string(),
             price,
             currency,
-            at,
+            at: time,
         })
     }
 

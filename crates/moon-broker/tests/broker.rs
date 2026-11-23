@@ -419,3 +419,48 @@ fn parse_currency_variants() {
     assert_eq!(parse_currency("DOLAR"), Some(Currency::Usd));
     assert_eq!(parse_currency("EUR"), None);
 }
+
+#[tokio::test]
+async fn iol_flow_dates_are_art() {
+    let (server, b) = iol_server().await;
+    Mock::given(method("GET"))
+        .and(path("/broker/accounts/activities"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!([
+            {"id": "a", "activity_type": "deposit", "net_amount": 1.0, "currency": "ARS",
+             "status": "completed", "trade_date": "2026-11-20"},
+            {"id": "b", "activity_type": "deposit", "net_amount": 1.0, "currency": "ARS",
+             "status": "completed", "trade_date": "2026-11-20T23:30:00"},
+            {"id": "c", "activity_type": "deposit", "net_amount": 1.0, "currency": "ARS",
+             "status": "completed", "trade_date": "2026-11-20T23:30:00-03:00"}
+        ]))))
+        .mount(&server)
+        .await;
+    let flows = b
+        .external_flows(d(2026, 11, 1), d(2026, 11, 23))
+        .await
+        .unwrap();
+    assert_eq!(flows.len(), 3);
+    for f in &flows {
+        assert_eq!(
+            moon_core::time::art_date(f.at),
+            d(2026, 11, 20),
+            "{}",
+            f.external_id
+        );
+    }
+    assert_eq!(
+        flows[0].at,
+        Utc.with_ymd_and_hms(2026, 11, 20, 3, 0, 0).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn paper_rejects_non_positive_qty() {
+    let (b, _, _) = paper(dec!(1000000), &[("SPY", dec!(5))]);
+    for q in [dec!(0), dec!(-3)] {
+        let r = b.place(&ticket(Side::Sell, q, None)).await.unwrap();
+        assert!(!r.accepted);
+        assert_eq!(r.messages, vec!["cantidad inválida (paper)".to_string()]);
+    }
+    assert_eq!(b.account().await.unwrap().cash_ars, dec!(1000000));
+}

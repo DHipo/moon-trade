@@ -98,6 +98,13 @@ impl Broker for PaperBroker {
 
     async fn place(&self, ticket: &OrderTicket) -> Result<PlaceResult, BrokerError> {
         let state_key = Self::key(ticket.idempotency_key);
+        if ticket.qty <= Decimal::ZERO {
+            return Ok(rejected(
+                format!("paper-{}", ticket.idempotency_key),
+                "cantidad inválida (paper)",
+            )
+            .into_result());
+        }
         if let Some(rec) = self.lock()?.get_state::<PaperOrderRecord>(&state_key)? {
             return Ok(rec.into_result());
         }
@@ -159,8 +166,7 @@ impl Broker for PaperBroker {
                     } else {
                         acct.positions.insert(ticket.symbol.clone(), new_pos);
                     }
-                    store.save_paper_account(&acct)?;
-                    PaperOrderRecord {
+                    let rec = PaperOrderRecord {
                         broker_order_id: id,
                         accepted: true,
                         messages: vec![],
@@ -170,7 +176,9 @@ impl Broker for PaperBroker {
                             avg_price: Some(fill_price),
                             fees: Some(fees),
                         }),
-                    }
+                    };
+                    store.apply_paper_fill(&acct, &state_key, &rec)?;
+                    return Ok(rec.into_result());
                 }
             }
         };

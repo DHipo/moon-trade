@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use moon_core::asset::Currency;
 use moon_core::money::{dec_from_f64, dec_to_f64};
-use moon_core::time::{Clock, art_date};
+use moon_core::time::{ART, Clock, art_date};
 use moon_core::types::{ExecMode, OrderStatus, Term};
 use moon_iol::{Country, IolClient, IolError, IolOrderRequest, OperationsQuery};
 use moon_store::FlowKind;
@@ -36,23 +36,30 @@ fn err(e: IolError) -> BrokerError {
     BrokerError::Broker(e.to_string())
 }
 
-fn dec(x: f64) -> Decimal {
-    dec_from_f64(x).unwrap_or(Decimal::ZERO)
+fn dec(x: f64) -> Result<Decimal, BrokerError> {
+    dec_from_f64(x)
+        .ok_or_else(|| BrokerError::Broker(format!("dato numérico inválido de IOL: {x}")))
 }
 
+/// Parses an IOL timestamp. RFC 3339 values keep their offset; date-only and naive values
+/// are interpreted as ART local time.
 fn parse_at(raw: Option<&str>, fallback: DateTime<Utc>) -> DateTime<Utc> {
     let Some(s) = raw else { return fallback };
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return dt.with_timezone(&Utc);
     }
-    if let Some(dt) = s
-        .get(..10)
-        .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-    {
-        return dt.and_utc();
-    }
-    fallback
+    let naive = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"]
+        .iter()
+        .find_map(|f| NaiveDateTime::parse_from_str(s, f).ok())
+        .or_else(|| {
+            s.get(..10)
+                .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+        });
+    naive
+        .and_then(|n| ART.from_local_datetime(&n).earliest())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or(fallback)
 }
 
 #[async_trait::async_trait]
@@ -69,7 +76,7 @@ impl Broker for IolBroker {
                 .or_else(|| b.totals.get(self.term))
         });
         let cash_ars = match cash {
-            Some(c) => dec(c),
+            Some(c) => dec(c)?,
             None => {
                 tracing::warn!("IOL no informó saldo en ARS para el plazo; se asume 0");
                 Decimal::ZERO
@@ -80,13 +87,13 @@ impl Broker for IolBroker {
         let mut sellable: BTreeMap<String, Decimal> = BTreeMap::new();
         for p in &pos.positions {
             let sym = p.instrument.symbol.clone();
-            *positions.entry(sym.clone()).or_default() += dec(p.quantity);
+            *positions.entry(sym.clone()).or_default() += dec(p.quantity)?;
             let avail = p
                 .availability
                 .as_ref()
                 .and_then(|a| a.quantity_available)
                 .unwrap_or(p.quantity);
-            *sellable.entry(sym).or_default() += dec(avail);
+            *sellable.entry(sym).or_default() += dec(avail)?;
         }
         Ok(AccountState {
             cash_ars,
@@ -150,8 +157,8 @@ impl Broker for IolBroker {
         };
         Ok(OrderProgress {
             status,
-            filled_qty: dec(qty),
-            avg_price: (price > 0.0).then(|| dec(price)),
+            filled_qty: dec(qty)?,
+            avg_price: (price > 0.0).then(|| dec(price)).transpose()?,
             fees: None,
         })
     }
@@ -191,10 +198,25 @@ impl Broker for IolBroker {
             out.push(ExternalFlow {
                 external_id: a.id,
                 kind,
-                amount_ars: dec(net.abs()),
+                amount_ars: dec(net.abs())?,
                 at: parse_at(a.trade_date.as_deref(), now),
             });
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dec_rejects_non_finite() {
+        for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let e = dec(x).unwrap_err();
+            assert!(e.to_string().contains("dato numérico inválido de IOL"));
+        }
+        assert_eq!(dec(1.5).unwrap(), rust_decimal::Decimal::new(15, 1));
     }
 }

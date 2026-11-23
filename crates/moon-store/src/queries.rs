@@ -597,6 +597,28 @@ impl Store {
         Ok(())
     }
 
+    /// Saves the paper account and a state entry in ONE transaction (atomic paper fill).
+    pub fn apply_paper_fill<T: serde::Serialize>(
+        &mut self,
+        account: &PaperAccount,
+        state_key: &str,
+        state_value: &T,
+    ) -> Result<(), StoreError> {
+        let raw = serde_json::to_string(state_value)?;
+        let positions = serde_json::to_string(&account.positions)?;
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO paper_account (id, cash_ars, positions) VALUES (1, ?1, ?2)              ON CONFLICT(id) DO UPDATE SET cash_ars = excluded.cash_ars,              positions = excluded.positions",
+            params![account.cash_ars.to_string(), positions],
+        )?;
+        tx.execute(
+            "INSERT INTO state_kv (key, value) VALUES (?1, ?2)              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![state_key, raw],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     // --- proposals ---
 
     pub fn insert_proposal(&mut self, p: &Proposal) -> Result<(), StoreError> {

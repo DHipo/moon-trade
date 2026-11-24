@@ -12,6 +12,7 @@ pub mod money;
 pub mod nav;
 pub mod rebalance;
 pub mod risk;
+pub mod risk_index;
 pub mod strategy;
 pub mod time;
 pub mod types;

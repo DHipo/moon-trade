@@ -19,6 +19,7 @@ use crate::money::{dec_from_f64, dec_to_f64, round_money};
 use crate::nav::NavTracker;
 use crate::rebalance::{RebalanceInput, RebalanceParams, plan_rebalance};
 use crate::risk::{DrawdownSignal, DrawdownState, RiskLimits};
+use crate::risk_index::RiskIndex;
 use crate::strategy::SignalContext;
 use crate::types::{OrderReason, Side};
 use crate::weights::TargetWeights;
@@ -37,6 +38,10 @@ pub struct BacktestConfig {
     pub holdout_start: Option<NaiveDate>,
     #[serde(default)]
     pub risk_free_rate: f64,
+    /// Annual return of idle cash in USD terms (default 0). Negative values model peso cash
+    /// losing value against the dollar. Accrued per trading day.
+    #[serde(default)]
+    pub cash_usd_return: f64,
 }
 
 pub struct BacktestInput<'a> {
@@ -138,6 +143,11 @@ pub fn run_backtest(input: &BacktestInput<'_>) -> Result<BacktestResult, CoreErr
             "el capital inicial debe ser > 0".into(),
         ));
     }
+    if !cfg.cash_usd_return.is_finite() || cfg.cash_usd_return <= -1.0 {
+        return Err(CoreError::InvalidConfig(
+            "cash_usd_return debe ser > -1".into(),
+        ));
+    }
     let refuge = universe.refuge().id.clone();
 
     // Tradable assets (non-CASH) with their series.
@@ -216,10 +226,15 @@ pub fn run_backtest(input: &BacktestInput<'_>) -> Result<BacktestResult, CoreErr
     let mut cash = cfg.initial_capital;
     let mut holdings: BTreeMap<AssetId, Decimal> = BTreeMap::new();
     let mut tracker = NavTracker::start(cfg.initial_capital);
-    let mut drawdown = DrawdownState::default();
+    // The breaker watches the invested part only (cash excluded), in USD.
+    let mut risk_index = RiskIndex::new();
+    let mut drawdown = DrawdownState {
+        peak_nav: 1.0,
+        ..Default::default()
+    };
+    let daily_cash_factor = dec_from_f64((1.0 + cfg.cash_usd_return).powf(1.0 / 252.0));
     let mut pending_emergency = false;
     let mut prev_equity = cfg.initial_capital;
-    let mut prev_nav = 1.0_f64;
 
     let mut curve: Vec<EquityPoint> = Vec::with_capacity(calendar.len());
     let mut trades: Vec<Trade> = Vec::new();
@@ -227,6 +242,13 @@ pub fn run_backtest(input: &BacktestInput<'_>) -> Result<BacktestResult, CoreErr
     let mut emergency_exits: Vec<NaiveDate> = Vec::new();
 
     for (i, &date) in calendar.iter().enumerate() {
+        if i > 0
+            && cfg.cash_usd_return != 0.0
+            && cash > Decimal::ZERO
+            && let Some(f) = daily_cash_factor
+        {
+            cash = round_money(cash * f);
+        }
         let mut flow = if i == 0 {
             cfg.initial_capital
         } else {
@@ -254,7 +276,8 @@ pub fn run_backtest(input: &BacktestInput<'_>) -> Result<BacktestResult, CoreErr
                     .allocate(&SignalContext::new(as_of, universe, input.series));
             let targets = decision.final_weights.clone();
             decisions.push(decision);
-            drawdown.reset(if i == 0 { 1.0 } else { prev_nav });
+            // Only the first decision after a trip re-arms the breaker.
+            drawdown.monthly_decision(risk_index.level);
             pending_emergency = false;
             (Some(targets), OrderReason::Monthly, false)
         } else if pending_emergency {
@@ -336,7 +359,18 @@ pub fn run_backtest(input: &BacktestInput<'_>) -> Result<BacktestResult, CoreErr
         let nav = tracker
             .nav(equity)
             .ok_or_else(|| missing("no hay unidades de NAV para valuar la cartera"))?;
-        if drawdown.observe(nav, date, input.risk.max_drawdown) == DrawdownSignal::Tripped {
+        let held: BTreeMap<String, Decimal> = holdings
+            .iter()
+            .map(|(id, q)| (id.to_string(), *q))
+            .collect();
+        let usd_prices: BTreeMap<String, Decimal> = close_prices
+            .iter()
+            .map(|(id, px)| (id.to_string(), *px))
+            .collect();
+        let at = date.and_hms_opt(20, 0, 0).unwrap_or_default().and_utc();
+        risk_index.observe(&held, &usd_prices, at)?;
+        let level = risk_index.level;
+        if drawdown.observe(level, date, input.risk.max_drawdown) == DrawdownSignal::Tripped {
             pending_emergency = true;
         }
         let refuge_weight = if equity > Decimal::ZERO {
@@ -350,11 +384,10 @@ pub fn run_backtest(input: &BacktestInput<'_>) -> Result<BacktestResult, CoreErr
             cash: round_money(cash),
             flow,
             nav,
-            drawdown: drawdown.drawdown(nav),
+            drawdown: drawdown.drawdown(level),
             refuge_weight,
         });
         prev_equity = equity;
-        prev_nav = nav;
     }
 
     let metrics = compute_metrics(&curve, &trades, cfg.risk_free_rate);
@@ -416,6 +449,7 @@ mod tests {
             fees: FeeModel::zero(),
             holdout_start: None,
             risk_free_rate: 0.0,
+            cash_usd_return: 0.0,
         }
     }
 
@@ -666,5 +700,64 @@ mod tests {
         })
         .unwrap();
         assert!(res.benchmark.is_some_and(|b| b.total_return > 0.0));
+    }
+
+    #[test]
+    fn slow_multi_month_decline_trips_the_breaker() {
+        // Strong rally, then -4 % per month: no single month is near the 15 % limit, but the
+        // running peak is, so the breaker must trip.
+        let n = 1300;
+        let rally_days = 900;
+        let monthly = 0.96_f64.powf(1.0 / 21.0);
+        let mut px = 100.0_f64;
+        let closes: Vec<f64> = (0..n)
+            .map(|i| {
+                px *= if i < rally_days { 1.006 } else { monthly };
+                px
+            })
+            .collect();
+        let series = series_a(&closes);
+        let res = run(&config(), &series, false).unwrap();
+        assert!(
+            !res.emergency_exits.is_empty(),
+            "max dd {:?}",
+            res.equity_curve
+                .iter()
+                .map(|p| p.drawdown)
+                .fold(0.0_f64, f64::max)
+        );
+        let peak_nav = res
+            .equity_curve
+            .iter()
+            .map(|p| p.nav)
+            .fold(0.0_f64, f64::max);
+        assert!(peak_nav > 1.0);
+    }
+
+    #[test]
+    fn cash_usd_return_erodes_idle_cash() {
+        // A falling series keeps the Faber signal out of A: the portfolio is all CASH.
+        let closes: Vec<f64> = (0..900).map(|i| 200.0 * 0.999_f64.powi(i)).collect();
+        let series = series_a(&closes);
+        let mut cfg = config();
+        cfg.cash_usd_return = -0.25;
+        let res = run(&cfg, &series, false).unwrap();
+        assert!(res.trades.is_empty(), "trades {:?}", res.trades);
+        let days = (res.equity_curve.len() - 1) as f64;
+        let expected = 10000.0 * 0.75_f64.powf(days / 252.0);
+        let fin = dec_to_f64(res.equity_curve.last().unwrap().equity);
+        assert!((fin - expected).abs() < 5.0, "final {fin} vs {expected}");
+        assert!(days > 252.0 * 0.9);
+    }
+
+    #[test]
+    fn invalid_cash_usd_return_is_rejected() {
+        let mut cfg = config();
+        cfg.cash_usd_return = -1.0;
+        let series = series_a(&rising(900));
+        assert!(matches!(
+            run(&cfg, &series, false),
+            Err(CoreError::InvalidConfig(_))
+        ));
     }
 }

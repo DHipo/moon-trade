@@ -171,6 +171,9 @@ pub fn check_orders(
     Ok(())
 }
 
+/// Drawdown breaker state. It works on a level series (normally `RiskIndex::level`, which
+/// measures the invested part in USD and ignores cash movements). `peak_nav` is a running
+/// maximum; only the first monthly decision after a trip resets it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct DrawdownState {
     pub peak_nav: f64,
@@ -210,7 +213,18 @@ impl DrawdownState {
         }
     }
 
-    /// Monthly decision: peak = nav, tripped = false.
+    /// Monthly decision. When the breaker is tripped, the decision clears it and re-bases the
+    /// peak at `level`; when it is not tripped the peak is left untouched, so a slow decline
+    /// across several months still accumulates. Returns whether a reset happened.
+    pub fn monthly_decision(&mut self, level: f64) -> bool {
+        if !self.tripped {
+            return false;
+        }
+        self.reset(level);
+        true
+    }
+
+    /// Unconditional reset: peak = level, tripped = false.
     pub fn reset(&mut self, nav: f64) {
         self.peak_nav = nav;
         self.tripped = false;
@@ -401,5 +415,23 @@ mod tests {
         assert_eq!(s.observe(0.84, day, 0.15), DrawdownSignal::Normal);
         assert_eq!(s.peak_nav, 0.84);
         assert_eq!(DrawdownState::default().drawdown(0.5), 0.0);
+    }
+
+    #[test]
+    fn monthly_decision_only_resets_after_a_trip() {
+        let day = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        let mut s = DrawdownState {
+            peak_nav: 1.0,
+            ..Default::default()
+        };
+        s.observe(0.92, day, 0.15);
+        assert!(!s.monthly_decision(0.92));
+        assert_eq!(s.peak_nav, 1.0);
+        s.observe(0.84, day, 0.15);
+        assert!(s.tripped);
+        assert!(s.monthly_decision(0.84));
+        assert!(!s.tripped);
+        assert_eq!(s.peak_nav, 0.84);
+        assert_eq!(s.tripped_on, None);
     }
 }

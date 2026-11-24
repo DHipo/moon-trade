@@ -686,7 +686,8 @@ impl Engine {
             missing += 1;
             self.db(|s| s.set_state(&key, &(missing, now)))?;
         }
-        let due = listing == Listing::NotListedTruncated || missing >= MISSING_CHECKS_BEFORE_NOTICE;
+        let due = (listing == Listing::NotListedTruncated && old_enough)
+            || missing >= MISSING_CHECKS_BEFORE_NOTICE;
         if due
             && self.notice_due(
                 &format!("order_missing_notice:{}", rec.id),

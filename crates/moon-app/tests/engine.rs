@@ -1788,14 +1788,74 @@ async fn order_missing_from_iol_after_three_refreshes_is_notified_once_per_day()
 }
 
 #[tokio::test]
-async fn truncated_list_without_the_order_is_notified_at_once() {
+async fn truncated_list_without_the_order_is_notified_once_it_is_ten_minutes_old() {
     let h = Harness::live(TradingMode::LiveAuto, dec!(0));
     arm_breaker(&h);
     h.engine.run_risk_check().await.expect("trip");
     h.fake().set_not_listed(Some(Listing::NotListedTruncated));
     h.clock.advance(Duration::minutes(1));
     h.engine.run_risk_check().await.expect("check");
+    assert_eq!(
+        count_msgs(&h, "no aparece en IOL"),
+        0,
+        "a fresh order may simply not be listed yet"
+    );
+    h.clock.advance(Duration::minutes(10));
+    h.engine.run_risk_check().await.expect("later check");
     assert_eq!(count_msgs(&h, "no aparece en IOL"), 1);
+}
+
+#[tokio::test]
+async fn unknown_outcome_monthly_sell_blocks_the_emergency_sell() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    // A monthly sell of AAA whose outcome is unknown (the order may exist at IOL).
+    let batch = uuid::Uuid::new_v4();
+    let id =
+        moon_app::engine::order_id_for(batch, &moon_core::asset::AssetId::new("AAA"), Side::Sell);
+    let now = clock_time();
+    let rec = moon_store::OrderRecord {
+        id,
+        batch_id: batch,
+        created_at: now - Duration::days(1),
+        updated_at: now - Duration::days(1),
+        mode: moon_core::types::ExecMode::Live,
+        reason: moon_core::types::OrderReason::Monthly,
+        asset: moon_core::asset::AssetId::new("AAA"),
+        symbol: "AAA".into(),
+        market: Market::Bcba,
+        side: Side::Sell,
+        qty: dec!(10),
+        limit_price: None,
+        currency: moon_core::asset::Currency::Ars,
+        status: moon_core::types::OrderStatus::Failed,
+        broker_order_id: None,
+        filled_qty: dec!(0),
+        avg_fill_price: None,
+        fees: dec!(0),
+        fees_estimated: false,
+        error: Some(format!(
+            "{} timeout de red",
+            moon_app::engine::UNKNOWN_OUTCOME
+        )),
+    };
+    h.store
+        .lock()
+        .expect("store")
+        .insert_order(&rec)
+        .expect("insert");
+    arm_breaker(&h);
+    h.engine.run_risk_check().await.expect("trip");
+    let placed_aaa = h
+        .fake()
+        .places()
+        .into_iter()
+        .filter(|t| t.symbol == "AAA" && t.side == Side::Sell)
+        .count();
+    assert_eq!(
+        placed_aaa, 0,
+        "never sell shares that an unknown-outcome sell may hold"
+    );
+    assert!(count_msgs(&h, "resultado desconocido") >= 1);
 }
 
 #[tokio::test]

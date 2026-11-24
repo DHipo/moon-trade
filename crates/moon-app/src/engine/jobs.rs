@@ -754,10 +754,31 @@ impl Engine {
         let mut unknown: Vec<String> = Vec::new();
         // A sell of another reason (monthly, deposit, manual) that is still alive, because IOL
         // has not confirmed its cancellation, holds the same shares: never sell them twice.
+        // A normal sell whose outcome is unknown may also hold those shares at IOL: treat it as alive.
+        let lookback_now = self.now();
+        let unknown_normal_sells: Vec<OrderRecord> = self
+            .db(|s| {
+                s.orders_between(
+                    mode,
+                    lookback_now - Duration::days(30),
+                    lookback_now + Duration::days(1),
+                )
+            })?
+            .into_iter()
+            .filter(|o| {
+                o.reason != OrderReason::Emergency
+                    && o.side == Side::Sell
+                    && o.status == OrderStatus::Failed
+                    && o.error
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with(UNKNOWN_OUTCOME))
+            })
+            .collect();
         let working_normal_sells: Vec<OrderRecord> = self
             .db(|s| s.open_orders(mode))?
             .into_iter()
             .filter(|o| o.reason != OrderReason::Emergency && o.side == Side::Sell)
+            .chain(unknown_normal_sells)
             .collect();
         let mut waiting: Vec<String> = Vec::new();
         for (asset, symbol, qty) in held {
@@ -766,8 +787,13 @@ impl Engine {
                     &format!("emergency_waits_for_cancel_notice:{}", o.id),
                     Duration::hours(1),
                 ) {
+                    let why = if o.status == OrderStatus::Failed {
+                        "tiene resultado desconocido (verificá en IOL y resolvela con `moon orders resolve`)"
+                    } else {
+                        "sigue vigente porque IOL no confirmó su cancelación"
+                    };
                     waiting.push(format!(
-                        "la venta de emergencia de {symbol} espera: la orden {} ({}) sigue vigente porque IOL no confirmó su cancelación. No se vende dos veces lo mismo; se reintenta la cancelación en cada control.",
+                        "la venta de emergencia de {symbol} espera: la orden {} ({}) {why}. No se vende dos veces lo mismo; se reintenta en cada control.",
                         super::text::short_id(o.id),
                         super::text::side_es(o.side)
                     ));

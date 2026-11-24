@@ -202,7 +202,7 @@ impl Broker for IolBroker {
             Some("completed") if completed_without_fill => OrderStatus::Sent,
             Some("completed") => OrderStatus::Filled,
             Some("pending") if qty > 0.0 => OrderStatus::PartiallyFilled,
-            Some("cancelled") => OrderStatus::Cancelled,
+            Some("cancelled" | "canceled") => OrderStatus::Cancelled,
             Some("rejected") => OrderStatus::Rejected,
             _ => OrderStatus::Sent,
         };

@@ -609,6 +609,25 @@ async fn iol_cancel_confirmed_by_status_alone_is_ok() {
 }
 
 #[tokio::test]
+async fn iol_refresh_accepts_both_spellings_of_cancelled() {
+    let (server, b) = iol_server().await;
+    Mock::given(method("GET"))
+        .and(path("/broker/accounts/activities/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!([
+            {"order_id": "a", "status": "canceled"},
+            {"order_id": "b", "status": "Cancelled"},
+            {"order_id": "c", "status": "CANCELED"}
+        ]))))
+        .mount(&server)
+        .await;
+    let from = d(2026, 11, 20);
+    for id in ["a", "b", "c"] {
+        let p = b.refresh(id, "SPY", from).await.unwrap();
+        assert_eq!(p.status, OrderStatus::Cancelled, "{id}");
+    }
+}
+
+#[tokio::test]
 async fn iol_external_flows_filters_deposits() {
     let (server, b) = iol_server().await;
     Mock::given(method("GET"))

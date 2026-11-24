@@ -4,6 +4,9 @@ use std::path::PathBuf;
 
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
+use uuid::Uuid;
+
+use crate::commands::orders::ResolveOutcome;
 use rust_decimal::Decimal;
 
 #[derive(Parser)]
@@ -45,6 +48,11 @@ pub enum Command {
         #[command(subcommand)]
         cmd: PaperCmd,
     },
+    /// Órdenes
+    Orders {
+        #[command(subcommand)]
+        cmd: OrdersCmd,
+    },
     Pause,
     Resume,
     Serve,
@@ -73,4 +81,22 @@ pub enum PaperCmd {
 pub enum CheckCmd {
     Iol,
     Telegram,
+}
+
+#[derive(Subcommand)]
+pub enum OrdersCmd {
+    /// Registra a mano el resultado de una orden con resultado desconocido, después de verificarlo
+    /// en IOL (solo modifica la base local: no llama a IOL)
+    Resolve {
+        /// Identificador de la orden (el que muestran los avisos)
+        order_id: Uuid,
+        /// Qué pasó en IOL: filled (ejecutada) o cancelled (inexistente o cancelada)
+        outcome: ResolveOutcome,
+        /// Cantidad ejecutada (por defecto la de la orden; en cancelled, para una ejecución parcial)
+        #[arg(long)]
+        qty: Option<Decimal>,
+        /// Precio promedio de ejecución (por defecto el límite de la orden)
+        #[arg(long)]
+        price: Option<Decimal>,
+    },
 }

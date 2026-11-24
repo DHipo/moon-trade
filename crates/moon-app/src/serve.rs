@@ -67,7 +67,7 @@ pub async fn serve(engine: Arc<Engine>, telegram: Option<TelegramClient>) -> any
 }
 
 fn load_state(engine: &Engine) -> ScheduleState {
-    match engine.db(|s| s.get_state::<ScheduleState>(STATE_SCHEDULE)) {
+    match engine.db(|s| s.get_state::<ScheduleState>(&engine.state_key(STATE_SCHEDULE))) {
         Ok(state) => state.unwrap_or_default(),
         Err(e) => {
             tracing::error!("no se pudo leer el estado del planificador: {e}");
@@ -77,7 +77,7 @@ fn load_state(engine: &Engine) -> ScheduleState {
 }
 
 fn save_state(engine: &Engine, state: &ScheduleState) {
-    if let Err(e) = engine.db(|s| s.set_state(STATE_SCHEDULE, state)) {
+    if let Err(e) = engine.db(|s| s.set_state(&engine.state_key(STATE_SCHEDULE), state)) {
         tracing::error!("no se pudo guardar el estado del planificador: {e}");
     }
 }

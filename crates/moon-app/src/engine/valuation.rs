@@ -15,14 +15,16 @@ use rust_decimal::Decimal;
 use super::{Engine, PositionValue, Valuation};
 
 impl Engine {
-    /// Values the account at current quotes. Any quote problem is an error: there is no partial
-    /// valuation, so trading never runs on incomplete prices.
+    /// Values the account at current quotes. A missing quote of a HELD asset (or of the CCL) is an
+    /// error: there is no partial valuation of what is owned. Assets that are not held and have no
+    /// quote are listed in `unpriced` and cannot be bought now.
     pub async fn valuation(&self) -> anyhow::Result<Valuation> {
         let account = self.deps.broker.account().await?;
         let now = self.now();
 
         let mut positions = Vec::new();
         let mut tracked: BTreeSet<String> = BTreeSet::new();
+        let mut unpriced: Vec<AssetId> = Vec::new();
         for asset in self.universe.tradable() {
             let exec = asset
                 .exec
@@ -34,18 +36,6 @@ impl Engine {
                     asset.id,
                     exec.currency.as_str()
                 );
-            }
-            let quote = self.deps.quotes.quote(&exec.symbol, exec.market).await?;
-            if quote.currency != Currency::Ars {
-                return Err(BrokerError::CurrencyMismatch {
-                    symbol: exec.symbol.clone(),
-                    expected: Currency::Ars,
-                    got: quote.currency.as_str().to_string(),
-                }
-                .into());
-            }
-            if quote.price <= Decimal::ZERO {
-                bail!("cotización inválida para {}", exec.symbol);
             }
             let qty = account
                 .positions
@@ -59,6 +49,38 @@ impl Engine {
                 .copied()
                 .unwrap_or(Decimal::ZERO)
                 .clamp(Decimal::ZERO, qty);
+            let held = qty > Decimal::ZERO;
+            // A missing quote only blocks the valuation when the asset is held: an asset that is
+            // not held simply cannot be bought now.
+            let quote = match self.deps.quotes.quote(&exec.symbol, exec.market).await {
+                Ok(q) if q.price > Decimal::ZERO || held => q,
+                Ok(_) => {
+                    tracked.insert(exec.symbol.clone());
+                    unpriced.push(asset.id.clone());
+                    continue;
+                }
+                Err(e) if held => return Err(e.into()),
+                Err(e) => {
+                    tracing::warn!(
+                        "sin cotización de {} (no está en cartera): {e}",
+                        exec.symbol
+                    );
+                    tracked.insert(exec.symbol.clone());
+                    unpriced.push(asset.id.clone());
+                    continue;
+                }
+            };
+            if quote.currency != Currency::Ars {
+                return Err(BrokerError::CurrencyMismatch {
+                    symbol: exec.symbol.clone(),
+                    expected: Currency::Ars,
+                    got: quote.currency.as_str().to_string(),
+                }
+                .into());
+            }
+            if quote.price <= Decimal::ZERO {
+                bail!("cotización inválida para {}", exec.symbol);
+            }
             tracked.insert(exec.symbol.clone());
             positions.push(PositionValue {
                 asset: asset.id.clone(),
@@ -95,12 +117,15 @@ impl Engine {
             .map(|(sym, qty)| (sym.clone(), *qty))
             .collect();
 
-        let equity_ars = account.cash_ars + positions.iter().map(|p| p.value_ars).sum::<Decimal>();
+        let equity_ars =
+            account.cash_total_ars + positions.iter().map(|p| p.value_ars).sum::<Decimal>();
         Ok(Valuation {
             at: now,
             cash_ars: account.cash_ars,
+            cash_total_ars: account.cash_total_ars,
             positions,
             untracked,
+            unpriced,
             equity_ars,
             ccl: fx.rate,
             equity_usd: round_money(equity_ars / fx.rate),
@@ -131,6 +156,41 @@ impl Engine {
         out
     }
 
+    /// Moves the weight of assets that cannot be priced (not held, no quote) to CASH.
+    fn without_unpriced(targets: &TargetWeights, v: &Valuation) -> TargetWeights {
+        if v.unpriced.is_empty() {
+            return targets.clone();
+        }
+        let mut out = TargetWeights::new();
+        let mut moved = 0.0;
+        for (id, w) in targets.iter() {
+            if v.unpriced.contains(id) {
+                moved += w;
+            } else {
+                out.add(id.clone(), w);
+            }
+        }
+        if moved > 0.0 {
+            out.add(AssetId::cash(), moved);
+        }
+        out
+    }
+
+    /// Tells the owner which targets were skipped because the asset has no quote.
+    pub(crate) async fn notify_unpriced(&self, v: &Valuation) {
+        if v.unpriced.is_empty() {
+            return;
+        }
+        let names: Vec<String> = v.unpriced.iter().map(ToString::to_string).collect();
+        self.deps
+            .notifier
+            .notify(&format!(
+                "⚠️ Sin cotización de {}: no se puede comprar ahora y se omite (el resto del plan sigue).",
+                names.join(", ")
+            ))
+            .await;
+    }
+
     pub fn plan(
         &self,
         targets: &TargetWeights,
@@ -139,6 +199,7 @@ impl Engine {
     ) -> anyhow::Result<RebalancePlan> {
         check_targets(targets, &self.universe, self.cfg.risk.max_weight)?;
         let targets = self.cap_to_max_equity(targets, v);
+        let targets = Self::without_unpriced(&targets, v);
         if !targets.is_valid() {
             bail!("los pesos objetivo no suman 1");
         }

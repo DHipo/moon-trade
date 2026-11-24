@@ -11,7 +11,7 @@ pub mod scheduler;
 pub mod serve;
 pub mod telegram_bot;
 
-use cli::{CheckCmd, Cli, Command, DataCmd, PaperCmd};
+use cli::{CheckCmd, Cli, Command, DataCmd, OrdersCmd, PaperCmd};
 use config::{AppConfig, load_secrets};
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -53,6 +53,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             let cfg = AppConfig::load(&cli.config)?;
             commands::paper::run_reset(cfg, &load_secrets()).await
+        }
+        Command::Orders {
+            cmd:
+                OrdersCmd::Resolve {
+                    order_id,
+                    outcome,
+                    qty,
+                    price,
+                },
+        } => {
+            let cfg = AppConfig::load(&cli.config)?;
+            commands::orders::run_resolve(&cfg, order_id, outcome, qty, price)
         }
         Command::Pause => {
             let cfg = AppConfig::load(&cli.config)?;

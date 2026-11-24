@@ -105,6 +105,7 @@ min_commission = 0
 [execution]
 slippage_rate = 0.003
 limit_tolerance = 0.005
+emergency_limit_discount = 0.03  # las ventas de emergencia van a límite este % por debajo del último precio
 price_tick = 0.01            # VERIFICAR el tick de precio de BYMA
 settlement_term = "T1"
 order_type = "limit"

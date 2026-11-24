@@ -4,12 +4,16 @@ use chrono::Duration;
 use moon_core::nav::NavTracker;
 use moon_core::rebalance::RebalancePlan;
 use moon_core::risk::DrawdownState;
+use moon_core::risk_index::RiskIndex;
 use moon_core::time::art_date;
 use moon_core::types::{OrderReason, OrderStatus, Side};
 use moon_core::weights::TargetWeights;
 use rust_decimal::Decimal;
 
-use super::{Engine, ExecutionReport, STATE_DRAWDOWN, STATE_NAV, UNKNOWN_OUTCOME, Valuation};
+use super::{
+    Engine, ExecutionReport, STATE_DRAWDOWN, STATE_NAV, STATE_RISK_INDEX, UNKNOWN_OUTCOME,
+    Valuation,
+};
 use crate::config::TradingMode;
 
 pub(crate) fn side_es(side: Side) -> &'static str {
@@ -135,15 +139,25 @@ impl Engine {
     /// Status text for an already computed valuation.
     fn render_status(&self, v: &Valuation) -> anyhow::Result<String> {
         let mode = self.exec_mode();
-        let tracker = self.db(|s| s.get_state::<NavTracker>(STATE_NAV))?;
-        let drawdown_state = self.db(|s| s.get_state::<DrawdownState>(STATE_DRAWDOWN))?;
-        let nav = tracker.and_then(|t| t.nav(v.equity_usd));
-        let nav_line = match nav {
-            Some(n) => {
-                let dd = drawdown_state.map_or(0.0, |d| d.drawdown(n));
-                format!("NAV: {n:.4} · caída desde el máximo: {}", pct(dd))
-            }
+        let (nav_key, dd_key, index_key) = (
+            self.state_key(STATE_NAV),
+            self.state_key(STATE_DRAWDOWN),
+            self.state_key(STATE_RISK_INDEX),
+        );
+        let tracker = self.db(|s| s.get_state::<NavTracker>(&nav_key))?;
+        let drawdown_state = self.db(|s| s.get_state::<DrawdownState>(&dd_key))?;
+        let risk_index = self.db(|s| s.get_state::<RiskIndex>(&index_key))?;
+        let nav_line = match tracker.and_then(|t| t.nav(v.equity_usd)) {
+            Some(n) => format!("NAV (rendimiento, incluye el efectivo): {n:.4}"),
             None => "NAV: sin datos todavía".to_string(),
+        };
+        let breaker_line = match (&risk_index, &drawdown_state) {
+            (Some(i), Some(d)) => format!(
+                "Freno: caída de lo invertido (en dólares) desde su máximo: {}{}",
+                pct(d.drawdown(i.level)),
+                if d.tripped { " · ACTIVADO" } else { "" }
+            ),
+            _ => "Freno: sin observaciones todavía".to_string(),
         };
         let decision = self.db(|s| s.recent_decisions(1))?;
         let open_orders = self.db(|s| s.open_orders(mode))?.len();
@@ -163,6 +177,7 @@ impl Engine {
                 v.ccl
             ),
             nav_line,
+            breaker_line,
             "Posiciones:".to_string(),
         ];
         for p in v.positions.iter().filter(|p| p.qty > Decimal::ZERO) {
@@ -177,8 +192,8 @@ impl Engine {
         }
         lines.push(format!(
             "• Efectivo: {} ({})",
-            ars(v.cash_ars),
-            weight_pct(v.cash_ars, v.equity_ars)
+            ars(v.cash_total_ars),
+            weight_pct(v.cash_total_ars, v.equity_ars)
         ));
         for (sym, qty) in &v.untracked {
             lines.push(format!("• {sym}: {qty} (fuera del universo, se ignora)"));
@@ -206,8 +221,9 @@ impl Engine {
         let week_ago = now - Duration::days(7);
 
         let snapshots = self.db(|s| s.snapshots_between(mode, week_ago, now))?;
+        let nav_key = self.state_key(STATE_NAV);
         let current_nav = self
-            .db(|s| s.get_state::<NavTracker>(STATE_NAV))?
+            .db(|s| s.get_state::<NavTracker>(&nav_key))?
             .and_then(|t| t.nav(v.equity_usd));
         let change = match (snapshots.first(), current_nav) {
             (Some(first), Some(nav)) if first.nav > 0.0 => {

@@ -169,6 +169,13 @@ impl FakeBroker {
         *self.fill_on_place.lock().expect("lock") = fees;
     }
 
+    /// Sets available cash and total cash (including committed funds) separately.
+    pub fn set_cash(&self, available: Decimal, total: Decimal) {
+        let mut a = self.account.lock().expect("lock");
+        a.cash_ars = available;
+        a.cash_total_ars = total;
+    }
+
     pub fn set_sellable(&self, symbol: &str, qty: Decimal) {
         self.account
             .lock()

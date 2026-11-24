@@ -35,6 +35,9 @@ pub enum QuoteSourceKind {
 pub struct ExecutionConfig {
     pub slippage_rate: Decimal,
     pub limit_tolerance: Decimal,
+    /// Emergency sells are limit orders this far below the last price (fraction, 0.03 = 3 %).
+    #[serde(default = "default_emergency_limit_discount")]
+    pub emergency_limit_discount: Decimal,
     pub price_tick: Decimal,
     pub settlement_term: Term,
     pub order_type: OrderType,
@@ -42,6 +45,10 @@ pub struct ExecutionConfig {
     pub approval_timeout_minutes: u32,
     pub fill_timeout_minutes: u32,
     pub poll_interval_seconds: u32,
+}
+
+fn default_emergency_limit_discount() -> Decimal {
+    Decimal::new(3, 2)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -168,6 +175,11 @@ impl AppConfig {
         }
         if !in_range(self.execution.limit_tolerance) {
             bail!("execution.limit_tolerance debe estar entre 0 y 0.05");
+        }
+        if self.execution.emergency_limit_discount < Decimal::ZERO
+            || self.execution.emergency_limit_discount > Decimal::new(2, 1)
+        {
+            bail!("execution.emergency_limit_discount debe estar entre 0 y 0.2");
         }
         if self.execution.price_tick <= Decimal::ZERO {
             bail!("execution.price_tick debe ser mayor que 0");

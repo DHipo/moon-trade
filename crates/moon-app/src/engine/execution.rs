@@ -53,11 +53,18 @@ impl Engine {
         batch_id: Uuid,
         emergency: bool,
     ) -> anyhow::Result<ExecutionReport> {
+        // Emergency exits never depend on the CCL (their order checks ignore the size limit).
         let ccl = self
             .db(|s| s.latest_fx())?
             .map(|fx| fx.rate)
-            .filter(|r| *r > Decimal::ZERO)
-            .ok_or_else(|| anyhow!("no hay tipo de cambio registrado: valuá la cartera primero"))?;
+            .filter(|r| *r > Decimal::ZERO);
+        let ccl = match (ccl, emergency) {
+            (Some(c), _) => c,
+            (None, true) => Decimal::ONE,
+            (None, false) => {
+                bail!("no hay tipo de cambio registrado: valuá la cartera primero")
+            }
+        };
 
         // An emergency exit only ever sells; buys of the plan (e.g. a non-cash refuge) are dropped.
         let first_phase: Vec<PlannedOrder> = if emergency {
@@ -107,7 +114,7 @@ impl Engine {
                 Ok((buys, cash)) => {
                     let mut cash_left = cash;
                     for order in &buys {
-                        let cost = order.est_value + order.est_fees;
+                        let cost = self.buy_cost(order);
                         if cost > cash_left {
                             errors.push(format!(
                                 "Compra de {} omitida: efectivo insuficiente (ventas pendientes).",
@@ -144,6 +151,33 @@ impl Engine {
             .notify(&execution_summary(reason, &report))
             .await;
         Ok(report)
+    }
+
+    /// Limit price of a non-emergency order: the reference price moved by the tolerance and
+    /// rounded to the tick in the unfavourable direction for us.
+    fn limit_price_for(&self, side: Side, ref_price: Decimal) -> Decimal {
+        let tolerance = self.cfg.execution.limit_tolerance;
+        let tick = self.cfg.execution.price_tick;
+        match side {
+            Side::Buy => ceil_to_tick(ref_price * (Decimal::ONE + tolerance), tick),
+            Side::Sell => {
+                let p = floor_to_tick(ref_price * (Decimal::ONE - tolerance), tick);
+                if p > Decimal::ZERO { p } else { tick }
+            }
+        }
+    }
+
+    /// Cash a buy can consume: `qty x limit price + estimated fees`; market orders use the
+    /// reference price moved by the limit tolerance.
+    fn buy_cost(&self, order: &PlannedOrder) -> Decimal {
+        let price = match self.cfg.execution.order_type {
+            OrderType::Limit => self.limit_price_for(Side::Buy, order.ref_price),
+            OrderType::Market => {
+                order.ref_price * (Decimal::ONE + self.cfg.execution.limit_tolerance)
+            }
+        };
+        let value = round_money(order.qty * price);
+        value + self.cfg.fees.total(value)
     }
 
     /// Caps every sell at the broker's sellable quantity (floored to the lot size); a sell with
@@ -233,23 +267,24 @@ impl Engine {
             .ok_or_else(|| anyhow!("{} no es operable", order.asset))?;
         let id = order_id_for(batch_id, &order.asset, order.side);
         let now = self.now();
-        let tolerance = self.cfg.execution.limit_tolerance;
-        let tick = self.cfg.execution.price_tick;
-        // Emergency sells go at market: the priority is getting out in a falling market.
-        let order_type = if emergency {
+        // Emergency sells: an aggressive limit (below the last price by the configured discount)
+        // when a fresh quote is known, otherwise at market; the priority is getting out.
+        let order_type = if emergency && order.ref_price <= Decimal::ZERO {
             OrderType::Market
+        } else if emergency {
+            OrderType::Limit
         } else {
             self.cfg.execution.order_type
         };
         let limit_price = match order_type {
             OrderType::Market => None,
-            OrderType::Limit => Some(match order.side {
-                Side::Buy => ceil_to_tick(order.ref_price * (Decimal::ONE + tolerance), tick),
-                Side::Sell => {
-                    let p = floor_to_tick(order.ref_price * (Decimal::ONE - tolerance), tick);
-                    if p > Decimal::ZERO { p } else { tick }
-                }
-            }),
+            OrderType::Limit if emergency => {
+                let tick = self.cfg.execution.price_tick;
+                let discount = self.cfg.execution.emergency_limit_discount;
+                let p = floor_to_tick(order.ref_price * (Decimal::ONE - discount), tick);
+                Some(if p > Decimal::ZERO { p } else { tick })
+            }
+            OrderType::Limit => Some(self.limit_price_for(order.side, order.ref_price)),
         };
         let mut rec = OrderRecord {
             id,
@@ -318,7 +353,7 @@ impl Engine {
                 ));
             }
             Ok(res) => {
-                rec.broker_order_id = Some(res.broker_order_id);
+                rec.broker_order_id = Some(res.broker_order_id).filter(|id| !id.is_empty());
                 if !res.accepted {
                     rec.status = OrderStatus::Rejected;
                     rec.error = Some(if res.messages.is_empty() {

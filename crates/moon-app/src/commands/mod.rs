@@ -2,6 +2,7 @@ pub mod backtest;
 pub mod check;
 pub mod data;
 pub mod init;
+pub mod orders;
 pub mod paper;
 pub mod pause;
 pub mod plan;

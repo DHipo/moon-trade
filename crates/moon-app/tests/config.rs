@@ -104,3 +104,16 @@ fn metrics_table_is_spanish() {
         assert!(t.contains(s), "{t}");
     }
 }
+
+#[test]
+fn emergency_limit_discount_defaults_and_is_validated() {
+    let mut cfg = example();
+    assert_eq!(cfg.execution.emergency_limit_discount, dec!(0.03));
+    cfg.execution.emergency_limit_discount = dec!(0.2);
+    cfg.validate().expect("0.2 is the upper bound");
+    cfg.execution.emergency_limit_discount = dec!(0.21);
+    let err = cfg.validate().expect_err("too large").to_string();
+    assert!(err.contains("emergency_limit_discount"), "{err}");
+    cfg.execution.emergency_limit_discount = dec!(-0.01);
+    assert!(cfg.validate().is_err());
+}

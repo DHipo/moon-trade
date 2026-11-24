@@ -20,6 +20,7 @@ use moon_core::allocator::{AllocationDecision, Allocator};
 use moon_core::asset::{AssetId, Universe};
 use moon_core::nav::NavTracker;
 use moon_core::risk::DrawdownState;
+use moon_core::risk_index::RiskIndex;
 use moon_core::strategy::SignalContext;
 use moon_core::time::{ART, Clock, art_date};
 use moon_core::types::{ExecMode, OrderReason};
@@ -34,22 +35,28 @@ use crate::notify::Notifier;
 
 pub use crate::scheduler::previous_trading_day;
 pub use reconcile::{Discrepancy, order_id_for, reconcile_positions};
+pub(crate) use text::status_es;
 
+// Global keys.
 pub const STATE_PAUSED: &str = "paused";
-pub const STATE_NAV: &str = "nav";
-pub const STATE_DRAWDOWN: &str = "drawdown";
 pub const STATE_TELEGRAM_OFFSET: &str = "telegram_offset";
-pub const STATE_SCHEDULE: &str = "schedule";
 /// Set once the paper account has been seeded with the configured initial cash.
+pub const STATE_PAPER_INIT: &str = "paper_initialized";
+
+// Mode-specific keys: always read and written through [`Engine::state_key`], which appends
+// `:<mode>` so paper and live never share NAV, breaker, schedule or flow state.
+/// NAV tracker (performance reporting only).
+pub const STATE_NAV: &str = "nav";
+/// Risk index the drawdown breaker works on.
+pub const STATE_RISK_INDEX: &str = "risk_index";
+pub const STATE_DRAWDOWN: &str = "drawdown";
+pub const STATE_SCHEDULE: &str = "schedule";
 /// Last day (ART) up to which external flows were queried.
 pub const STATE_FLOWS_CHECKED: &str = "flows_checked_until";
-/// When the user was last warned that deposits/withdrawals could not be queried.
-pub const STATE_FLOWS_WARNED: &str = "flows_query_warned_at";
 /// Trip date for which the refuge buy after an emergency exit was already attempted.
 pub const STATE_EMERGENCY_REFUGE: &str = "emergency_refuge_done";
 /// Per asset, the last day the user was warned about an emergency order with unknown outcome.
 pub const STATE_EMERGENCY_UNKNOWN: &str = "emergency_unknown_notified";
-pub const STATE_PAPER_INIT: &str = "paper_initialized";
 
 /// Start of the error raised when the order limits block an execution.
 pub(crate) const ORDER_BLOCKED: &str = "Orden bloqueada por los límites de riesgo";
@@ -90,9 +97,14 @@ pub struct PositionValue {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Valuation {
     pub at: DateTime<Utc>,
+    /// Cash available for buying.
     pub cash_ars: Decimal,
+    /// Cash including committed funds (pending buys, settlement): used for equity.
+    pub cash_total_ars: Decimal,
     pub positions: Vec<PositionValue>,
     pub untracked: Vec<(String, Decimal)>,
+    /// Tradable assets that are not held and had no usable quote: they cannot be bought now.
+    pub unpriced: Vec<AssetId>,
     pub equity_ars: Decimal,
     pub ccl: Decimal,
     pub equity_usd: Decimal,
@@ -114,7 +126,8 @@ pub enum MonthlyOutcome {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RiskOutcome {
-    pub nav: f64,
+    /// Risk index level (chained market return of the invested part, in USD).
+    pub level: f64,
     pub drawdown: f64,
     pub tripped: bool,
     pub emergency: Option<ExecutionReport>,
@@ -228,35 +241,62 @@ impl Engine {
         art_date(self.now())
     }
 
+    /// Key of a mode-specific state entry: `<base>:<mode>`.
+    pub fn state_key(&self, base: &str) -> String {
+        format!("{base}:{}", self.exec_mode().as_str())
+    }
+
     /// Loads the NAV tracker, starting it at `initial_equity_usd` when absent or empty.
     pub(crate) fn load_tracker(&self, initial_equity_usd: Decimal) -> anyhow::Result<NavTracker> {
-        let existing = self.db(|s| s.get_state::<NavTracker>(STATE_NAV))?;
+        let key = self.state_key(STATE_NAV);
+        let existing = self.db(|s| s.get_state::<NavTracker>(&key))?;
         match existing {
             Some(t) if t.units > Decimal::ZERO => Ok(t),
             _ => {
                 let t = NavTracker::start(initial_equity_usd);
-                self.db(|s| s.set_state(STATE_NAV, &t))?;
+                self.db(|s| s.set_state(&key, &t))?;
                 Ok(t)
             }
         }
     }
 
-    pub(crate) fn load_drawdown(&self, nav: f64) -> anyhow::Result<DrawdownState> {
-        let existing = self.db(|s| s.get_state::<DrawdownState>(STATE_DRAWDOWN))?;
+    /// The risk index of this mode; a fresh one (level 1.0) when there is none yet.
+    pub(crate) fn load_risk_index(&self) -> anyhow::Result<RiskIndex> {
+        let key = self.state_key(STATE_RISK_INDEX);
+        Ok(self
+            .db(|s| s.get_state::<RiskIndex>(&key))?
+            .unwrap_or_else(RiskIndex::new))
+    }
+
+    pub(crate) fn save_risk_index(&self, index: &RiskIndex) -> anyhow::Result<()> {
+        let key = self.state_key(STATE_RISK_INDEX);
+        self.db(|s| s.set_state(&key, index))
+    }
+
+    /// The breaker state of this mode; when absent, the peak starts at the current `level`.
+    pub(crate) fn load_drawdown(&self, level: f64) -> anyhow::Result<DrawdownState> {
+        let key = self.state_key(STATE_DRAWDOWN);
+        let existing = self.db(|s| s.get_state::<DrawdownState>(&key))?;
         match existing {
             Some(d) => Ok(d),
             None => {
                 let d = DrawdownState {
-                    peak_nav: nav,
+                    peak_nav: level,
                     ..DrawdownState::default()
                 };
-                self.db(|s| s.set_state(STATE_DRAWDOWN, &d))?;
+                self.db(|s| s.set_state(&key, &d))?;
                 Ok(d)
             }
         }
     }
 
-    /// NAV of `tracker` at `equity_usd`; an empty tracker is an explicit error, never a guess.
+    pub(crate) fn save_drawdown(&self, d: &DrawdownState) -> anyhow::Result<()> {
+        let key = self.state_key(STATE_DRAWDOWN);
+        self.db(|s| s.set_state(&key, d))
+    }
+
+    /// NAV of `tracker` at `equity_usd` (performance reporting); an empty tracker is an explicit
+    /// error, never a guess.
     pub(crate) fn nav_of(tracker: &NavTracker, equity_usd: Decimal) -> anyhow::Result<f64> {
         tracker.nav(equity_usd).ok_or_else(|| {
             anyhow!("no se puede calcular el NAV: no hay unidades (patrimonio en cero)")

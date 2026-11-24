@@ -55,13 +55,25 @@ impl RiskIndex {
             let Some(prev) = self.prices_usd.get(sym) else {
                 continue;
             };
-            let now = prices_usd
-                .get(sym)
-                .ok_or_else(|| CoreError::MissingPrice(crate::asset::AssetId::new(sym.as_str())))?;
             let q = dec_to_f64(*qty);
-            let (p0, p1) = (dec_to_f64(*prev), dec_to_f64(*now));
+            let p0 = dec_to_f64(*prev);
+            let Some(now) = prices_usd.get(sym) else {
+                let still_held = holdings.get(sym).is_some_and(|h| *h > Decimal::ZERO);
+                if still_held {
+                    return Err(CoreError::MissingPrice(crate::asset::AssetId::new(
+                        sym.as_str(),
+                    )));
+                }
+                // Sold since the last observation and no price now: its proceeds are cash, so
+                // its period return counts as zero.
+                tracing::warn!(
+                    "{sym} ya no está en cartera y no tiene precio: su retorno del período se toma como 0"
+                );
+                base += q * p0;
+                continue;
+            };
             base += q * p0;
-            gain += q * (p1 - p0);
+            gain += q * (dec_to_f64(*now) - p0);
         }
         let r = if base > 0.0 && base.is_finite() && gain.is_finite() {
             gain / base
@@ -92,6 +104,26 @@ mod tests {
 
     fn map(items: &[(&str, Decimal)]) -> BTreeMap<String, Decimal> {
         items.iter().map(|(s, v)| (s.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn sold_symbol_without_a_price_counts_as_zero_return() {
+        let mut idx = RiskIndex::new();
+        idx.observe(
+            &map(&[("A", dec!(10)), ("B", dec!(10))]),
+            &map(&[("A", dec!(10)), ("B", dec!(10))]),
+            t(1),
+        )
+        .unwrap();
+        // A was sold (no longer held, no price); B gained 10 %: weighted return 5 %.
+        let r = idx
+            .observe(&map(&[("B", dec!(10))]), &map(&[("B", dec!(11))]), t(2))
+            .unwrap();
+        assert!((r - 0.05).abs() < 1e-12, "{r}");
+        assert!((idx.level - 1.05).abs() < 1e-12);
+        // B is still held without a price: that keeps failing.
+        let err = idx.observe(&map(&[("B", dec!(10))]), &BTreeMap::new(), t(3));
+        assert!(err.is_err());
     }
 
     #[test]

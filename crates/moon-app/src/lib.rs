@@ -64,7 +64,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 },
         } => {
             let cfg = AppConfig::load(&cli.config)?;
-            commands::orders::run_resolve(&cfg, order_id, outcome, qty, price)
+            commands::orders::run_resolve(&cfg, &order_id, outcome, qty, price)
+        }
+        Command::Orders {
+            cmd: OrdersCmd::List { unknown },
+        } => {
+            let cfg = AppConfig::load(&cli.config)?;
+            commands::orders::run_list(&cfg, unknown)
         }
         Command::Pause => {
             let cfg = AppConfig::load(&cli.config)?;

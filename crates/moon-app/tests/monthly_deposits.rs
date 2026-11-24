@@ -475,3 +475,205 @@ async fn weekly_report_shows_flows_and_the_equity_bridge() {
     assert!(weekly.contains("resultado +0"), "{weekly}");
     assert!(weekly.contains("final 1500"), "{weekly}");
 }
+
+fn snapshot_at(
+    at: DateTime<Utc>,
+    ccl: rust_decimal::Decimal,
+    equity_usd: rust_decimal::Decimal,
+) -> moon_store::Snapshot {
+    moon_store::Snapshot {
+        at,
+        mode: ExecMode::Paper,
+        cash_ars: dec!(0),
+        cash_total_ars: None,
+        equity_ars: equity_usd * ccl,
+        ccl,
+        equity_usd,
+        nav: 1.0,
+        units: dec!(1),
+        drawdown: 0.0,
+        positions: std::collections::BTreeMap::new(),
+    }
+}
+
+fn paper_flow(
+    at: DateTime<Utc>,
+    kind: FlowKind,
+    amount: rust_decimal::Decimal,
+    id: &str,
+) -> moon_store::FlowRecord {
+    moon_store::FlowRecord {
+        at,
+        mode: ExecMode::Paper,
+        kind,
+        amount_ars: amount,
+        external_id: Some(id.to_string()),
+        note: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn weekly_bridge_ignores_deposits_already_in_the_first_snapshot() {
+    // A deposit dated before the first snapshot of the week is already inside the initial equity.
+    let h = Harness::paper(dec!(2400000));
+    h.engine.run_daily_close(TODAY).await.expect("close");
+    h.store
+        .lock()
+        .expect("lock")
+        .insert_flow(&paper_flow(
+            clock_time() - ChronoDuration::hours(1),
+            FlowKind::Deposit,
+            dec!(1200000),
+            "before-first-snapshot",
+        ))
+        .expect("flow");
+    // Real result of +100 USD afterwards (ARS 120,000 at the CCL of 1200).
+    h.clock.advance(ChronoDuration::days(1));
+    h.store
+        .lock()
+        .expect("lock")
+        .save_paper_account(&moon_store::PaperAccount {
+            cash_ars: dec!(2520000),
+            positions: std::collections::BTreeMap::new(),
+        })
+        .expect("save");
+    let weekly = h.engine.weekly_report().await.expect("weekly");
+    assert!(weekly.contains("inicial 2000"), "{weekly}");
+    assert!(weekly.contains("aportes netos +0"), "{weekly}");
+    assert!(weekly.contains("resultado +100"), "{weekly}");
+    assert!(weekly.contains("final 2100"), "{weekly}");
+}
+
+#[tokio::test]
+async fn weekly_bridge_converts_each_flow_at_the_ccl_of_the_next_snapshot() {
+    let h = Harness::paper(dec!(1200000));
+    let now = clock_time();
+    {
+        let mut s = h.store.lock().expect("lock");
+        for (days, ccl, equity) in [(3, 1000, 1000), (2, 1500, 1400), (1, 1600, 1400)] {
+            s.insert_snapshot(&snapshot_at(
+                now - ChronoDuration::days(days),
+                rust_decimal::Decimal::from(ccl),
+                rust_decimal::Decimal::from(equity),
+            ))
+            .expect("snap");
+        }
+        // After the first snapshot, before the second: converted at 1500, not at today's CCL.
+        s.insert_flow(&paper_flow(
+            now - ChronoDuration::hours(60),
+            FlowKind::Deposit,
+            dec!(600000),
+            "dep",
+        ))
+        .expect("flow");
+    }
+    let weekly = h.engine.weekly_report().await.expect("weekly");
+    assert!(weekly.contains("aportes netos +400"), "{weekly}");
+}
+
+// --- N5: decisions per mode ---
+
+#[tokio::test]
+async fn monthly_decision_is_logged_with_its_mode() {
+    let h = Harness::paper(dec!(1200000));
+    h.engine.run_monthly(TODAY).await.expect("monthly");
+    {
+        let s = h.store.lock().expect("lock");
+        assert!(
+            !s.recent_decisions(5, ExecMode::Paper)
+                .expect("paper")
+                .is_empty()
+        );
+        assert!(
+            s.recent_decisions(5, ExecMode::Live)
+                .expect("live")
+                .is_empty()
+        );
+    }
+
+    let h = Harness::live(TradingMode::LiveAuto, dec!(1200000));
+    h.engine.run_monthly(TODAY).await.expect("monthly");
+    let s = h.store.lock().expect("lock");
+    assert!(
+        !s.recent_decisions(5, ExecMode::Live)
+            .expect("live")
+            .is_empty()
+    );
+    assert!(
+        s.recent_decisions(5, ExecMode::Paper)
+            .expect("paper")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn live_deposit_ignores_paper_decisions_and_waits_for_the_first_live_monthly() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(1200000));
+    h.fake().set_fill_on_place(Some(None));
+    // A stale paper decision sits in the registry (shared database).
+    let weights = h.engine.decide(TODAY).expect("decision").final_weights;
+    h.store
+        .lock()
+        .expect("lock")
+        .log_decision(
+            clock_time(),
+            "monthly",
+            ExecMode::Paper,
+            &serde_json::json!({"as_of": TODAY, "decision": {"final_weights": weights}}),
+        )
+        .expect("log");
+    let acct = h.fake().account_snapshot();
+    h.fake().set_cash(
+        acct.cash_ars + dec!(600000),
+        acct.cash_total_ars + dec!(600000),
+    );
+    h.fake().add_flow(ExternalFlow {
+        external_id: "dep-funding".into(),
+        kind: FlowKind::Deposit,
+        amount_ars: dec!(600000),
+        at: clock_time(),
+    });
+    h.engine.check_deposits().await.expect("check");
+    assert!(deposit_orders(&h, ExecMode::Live).is_empty());
+    assert!(h.fake().places().is_empty());
+    // The deposit stays pending for the first live monthly.
+    let key = h.engine.state_key(STATE_DEPOSIT_PENDING);
+    let pending: Option<Vec<String>> = h.store.lock().expect("lock").get_state(&key).expect("get");
+    assert_eq!(pending.map(|p| p.len()), Some(1));
+}
+
+// --- N6: short ids in notifications and status ---
+
+#[tokio::test]
+async fn notifications_and_status_show_short_order_ids() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(1200000));
+    let MonthlyOutcome::Executed(report) = h.engine.run_monthly(TODAY).await.expect("monthly")
+    else {
+        panic!("expected Executed");
+    };
+    let sent = report.orders.first().expect("an order");
+    let short = moon_app::engine::short_id(sent.id);
+    assert!(
+        h.notifier.messages().iter().any(|m| m.contains(&short)),
+        "{:?}",
+        h.notifier.messages()
+    );
+    let status = h.engine.status_text().await.expect("status");
+    assert!(status.contains(&short), "{status}");
+}
+
+#[tokio::test]
+async fn status_lists_unknown_outcome_orders_with_short_ids() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(1200000));
+    h.fake().set_fail_place(true);
+    h.engine.run_monthly(TODAY).await.expect("monthly");
+    let unknown: Vec<_> = orders(&h, ExecMode::Live)
+        .into_iter()
+        .filter(|o| o.status == OrderStatus::Failed)
+        .collect();
+    assert_eq!(unknown.len(), 1);
+    let short = moon_app::engine::short_id(unknown[0].id);
+    let status = h.engine.status_text().await.expect("status");
+    assert!(status.contains(&short), "{status}");
+    assert!(status.contains("resultado desconocido"), "{status}");
+}

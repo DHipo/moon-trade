@@ -54,7 +54,12 @@ async fn paper_monthly_rebalance_buys_from_cash() {
     let acct = store.paper_account().expect("account");
     assert!(!acct.positions.is_empty());
     assert!(acct.cash_ars >= Decimal::ZERO);
-    assert!(!store.recent_decisions(5).expect("decisions").is_empty());
+    assert!(
+        !store
+            .recent_decisions(5, ExecMode::Paper)
+            .expect("decisions")
+            .is_empty()
+    );
 }
 
 #[tokio::test]

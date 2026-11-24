@@ -488,6 +488,81 @@ async fn iol_refresh_status_mapping() {
     assert_eq!(get("missing").await.status, OrderStatus::Sent);
 }
 
+async fn mount_place(server: &MockServer, order_id: &str) {
+    Mock::given(method("POST"))
+        .and(path("/broker/orders"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(envelope(json!({
+            "order_id": order_id, "successful_purchase": true, "messages": []
+        }))))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn iol_refresh_narrows_query_by_symbol_of_placed_order() {
+    let (server, b) = iol_server().await;
+    mount_place(&server, "55").await;
+    Mock::given(method("GET"))
+        .and(path("/broker/accounts/activities/operations"))
+        .and(query_param("symbol", "SPY"))
+        .and(query_param("start_date", "2026-11-20"))
+        .and(query_param("end_date", "2026-11-23"))
+        .and(query_param("country", "AR"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!([
+            {"order_id": "55", "status": "completed", "executed": {"qty": 3, "price": 10.0}}
+        ]))))
+        .expect(1)
+        .mount(&server)
+        .await;
+    b.place(&ticket(Side::Buy, dec!(3), None)).await.unwrap();
+    let p = b.refresh("55", d(2026, 11, 20)).await.unwrap();
+    assert_eq!(p.status, OrderStatus::Filled);
+}
+
+#[tokio::test]
+async fn iol_refresh_without_known_symbol_queries_unfiltered() {
+    let (server, b) = iol_server().await;
+    Mock::given(method("GET"))
+        .and(path("/broker/accounts/activities/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!([
+            {"order_id": "9", "status": "cancelled"}
+        ]))))
+        .mount(&server)
+        .await;
+    let p = b.refresh("9", d(2026, 11, 20)).await.unwrap();
+    assert_eq!(p.status, OrderStatus::Cancelled);
+    let reqs = server.received_requests().await.unwrap();
+    let ops_req = reqs
+        .iter()
+        .find(|r| r.url.path() == "/broker/accounts/activities/operations")
+        .unwrap();
+    assert!(
+        !ops_req.url.query_pairs().any(|(k, _)| k == "symbol"),
+        "{}",
+        ops_req.url
+    );
+}
+
+#[tokio::test]
+async fn iol_refresh_truncated_list_without_the_order_stays_sent() {
+    let (server, b) = iol_server().await;
+    Mock::given(method("GET"))
+        .and(path("/broker/accounts/activities/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": {"status_code": 200, "total_count": 500},
+            "data": [{"order_id": "other", "status": "cancelled"}],
+            "error": null
+        })))
+        .mount(&server)
+        .await;
+    let p = b.refresh("lost", d(2026, 11, 20)).await.unwrap();
+    assert_eq!(p.status, OrderStatus::Sent);
+    assert_eq!(p.filled_qty, dec!(0));
+    // An order that is present in a truncated list still resolves normally.
+    let p = b.refresh("other", d(2026, 11, 20)).await.unwrap();
+    assert_eq!(p.status, OrderStatus::Cancelled);
+}
+
 #[tokio::test]
 async fn iol_cancel_calls_delete() {
     let (server, b) = iol_server().await;

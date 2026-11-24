@@ -138,6 +138,10 @@ async fn check_iol_prints_the_extended_report() {
         "{out}"
     );
     // distinct operation statuses and activity types with amounts
+    assert!(
+        out.contains("3 devueltas, total informado por IOL: no informado"),
+        "{out}"
+    );
     assert!(out.contains("estado «completed»: 2"), "{out}");
     assert!(out.contains("estado «cancelled»: 1"), "{out}");
     assert!(

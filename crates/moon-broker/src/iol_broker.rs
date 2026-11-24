@@ -20,6 +20,9 @@ pub struct IolBroker {
     client: Arc<IolClient>,
     term: Term,
     clock: Arc<dyn Clock>,
+    /// Symbol of each order placed by this process, so `refresh` can narrow the query.
+    /// Unknown after a restart: `refresh` then queries without the symbol filter.
+    symbols: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl IolBroker {
@@ -28,7 +31,18 @@ impl IolBroker {
             client,
             term,
             clock,
+            symbols: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    fn remember_symbol(&self, order_id: &str, symbol: &str) {
+        if let Ok(mut m) = self.symbols.lock() {
+            m.insert(order_id.to_string(), symbol.to_string());
+        }
+    }
+
+    fn symbol_of(&self, order_id: &str) -> Option<String> {
+        self.symbols.lock().ok()?.get(order_id).cloned()
     }
 }
 
@@ -132,6 +146,9 @@ impl Broker for IolBroker {
             // Timeouts, 5xx, 408/409/429 and unparsable replies: the outcome is unknown.
             Err(e) => return Err(err(e)),
         };
+        if ack.successful_purchase && !ack.order_id.is_empty() {
+            self.remember_symbol(&ack.order_id, &ticket.symbol);
+        }
         Ok(PlaceResult {
             broker_order_id: ack.order_id,
             accepted: ack.successful_purchase,
@@ -145,18 +162,28 @@ impl Broker for IolBroker {
         broker_order_id: &str,
         placed_on: NaiveDate,
     ) -> Result<OrderProgress, BrokerError> {
-        let ops = self
+        let page = self
             .client
             .operations(&OperationsQuery {
                 start_date: placed_on,
                 end_date: art_date(self.clock.now()),
                 country: Some("AR".into()),
-                symbol: None,
+                symbol: self.symbol_of(broker_order_id),
                 state: None,
             })
             .await
             .map_err(err)?;
-        let found = ops.iter().find(|o| o.order_id == broker_order_id);
+        if let Some(total) = page.total_count
+            && total > page.items.len() as u64
+        {
+            tracing::warn!(
+                order_id = broker_order_id,
+                returned = page.items.len(),
+                total_count = total,
+                "IOL devolvió menos operaciones que su total; la lista puede estar truncada"
+            );
+        }
+        let found = page.items.iter().find(|o| o.order_id == broker_order_id);
         let (mut qty, price) = found
             .and_then(|o| o.executed.as_ref())
             .map(|e| (e.qty.unwrap_or(0.0), e.price.unwrap_or(0.0)))

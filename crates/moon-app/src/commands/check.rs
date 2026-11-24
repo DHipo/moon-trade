@@ -114,15 +114,24 @@ pub async fn iol_report(
         })
         .await
     {
-        Ok(ops) => {
+        Ok(page) => {
+            let ops = page.items;
             let mut by_status: BTreeMap<String, usize> = BTreeMap::new();
             for o in &ops {
                 *by_status.entry(o.status.clone()).or_default() += 1;
             }
             lines.push(format!(
-                "✅ Operaciones de los últimos 30 días: {}",
-                ops.len()
+                "✅ Operaciones de los últimos 30 días: {} devueltas, total informado por IOL: {}",
+                ops.len(),
+                page.total_count
+                    .map_or_else(|| "no informado".to_string(), |t| t.to_string())
             ));
+            if page.total_count.is_some_and(|t| t > ops.len() as u64) {
+                lines.push(
+                    "⚠️ IOL devolvió menos operaciones que su total: la lista está truncada"
+                        .to_string(),
+                );
+            }
             for (status, n) in by_status {
                 lines.push(format!("   • estado «{status}»: {n}"));
             }

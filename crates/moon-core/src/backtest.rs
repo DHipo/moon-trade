@@ -437,6 +437,7 @@ mod tests {
             max_orders_per_day: 10,
             cash_buffer: 0.0,
             max_equity_usd: None,
+            trip_confirmations: 2,
         }
     }
 

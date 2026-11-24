@@ -567,19 +567,23 @@ impl Store {
         )
     }
 
-    /// Orders (any mode) whose id starts with `prefix` (hex digits and dashes only; anything
+    /// Orders of `mode` whose id starts with `prefix` (hex digits and dashes only; anything
     /// else matches nothing), oldest first.
-    pub fn orders_by_id_prefix(&self, prefix: &str) -> Result<Vec<OrderRecord>, StoreError> {
+    pub fn orders_by_id_prefix(
+        &self,
+        mode: ExecMode,
+        prefix: &str,
+    ) -> Result<Vec<OrderRecord>, StoreError> {
         if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
             return Ok(Vec::new());
         }
         query_all(
             &self.conn,
             &format!(
-                "SELECT {ORDER_COLS} FROM orders WHERE lower(id) LIKE ?1 \
+                "SELECT {ORDER_COLS} FROM orders WHERE mode = ?1 AND lower(id) LIKE ?2 \
                  ORDER BY created_at ASC, rowid ASC"
             ),
-            [format!("{}%", prefix.to_ascii_lowercase())],
+            params![mode.as_str(), format!("{}%", prefix.to_ascii_lowercase())],
             order_from_row,
         )
     }
@@ -793,7 +797,7 @@ impl Store {
         query_all(
             &self.conn,
             &format!(
-                "SELECT id, at, kind, payload FROM decisions WHERE {filter}                  ORDER BY id DESC LIMIT ?1"
+                "SELECT id, at, kind, payload FROM decisions WHERE {filter} ORDER BY id DESC LIMIT ?1"
             ),
             [i64::try_from(limit).unwrap_or(i64::MAX)],
             decision_from_row,

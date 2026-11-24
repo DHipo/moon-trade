@@ -64,33 +64,73 @@ pub const STATE_EMERGENCY_REFUGE: &str = "emergency_refuge_done";
 /// Per asset, the last day the user was warned about an emergency order with unknown outcome.
 pub const STATE_EMERGENCY_UNKNOWN: &str = "emergency_unknown_notified";
 
-/// Symbols whose pending suspected ratio change the owner accepted; the next risk check applies
-/// them to the risk index (a separate key, so the CLI never races the service on the index).
-pub const STATE_RISK_ACCEPT: &str = "risk_accept";
+/// Symbols whose pending suspected ratio change the owner said was a REAL move (`/caida`); the
+/// next scheduled risk check counts it from the kept base (a separate key, so the CLI never
+/// races the service on the index). The key keeps its old name so pending requests survive.
+pub const STATE_RISK_DROP: &str = "risk_accept";
+/// Symbols whose pending suspected ratio change the owner said was a ratio change (`/ratio`):
+/// the next scheduled risk check rebases them with zero return.
+pub const STATE_RISK_RATIO: &str = "risk_ratio";
 
-/// Records the owner's acceptance of the pending suspected ratio change of `symbol`: the next
-/// risk check counts the move from the kept base as real. Fails when nothing is pending for it.
-pub fn request_ratio_accept(
+/// What the owner decided about a pending suspected ratio change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RatioDecision {
+    /// It was a ratio change: rebase with zero return.
+    Ratio,
+    /// It was a real market move: count it from the kept base.
+    Drop,
+}
+
+/// Records the owner's decision about the pending suspected ratio change of `symbol` and
+/// returns the Spanish reply. It only RECORDS: no risk check runs here; the scheduler applies it
+/// at its next risk check (business days, market hours) or, while the breaker is active, at the
+/// next monthly decision. Fails when nothing is pending for the symbol.
+pub fn request_ratio_decision(
     store: &mut Store,
     mode: ExecMode,
     symbol: &str,
+    decision: RatioDecision,
 ) -> anyhow::Result<String> {
+    let (cmd, cli) = match decision {
+        RatioDecision::Ratio => ("/ratio", "moon risk ratio"),
+        RatioDecision::Drop => ("/caida", "moon risk drop"),
+    };
     let symbol = symbol.trim().to_uppercase();
     if symbol.is_empty() {
-        bail!("Indicá el símbolo: por ejemplo `/aceptar AAPL`.");
+        bail!("Indicá el símbolo: por ejemplo `{cmd} AAPL` (o `{cli} AAPL`).");
     }
     let index: Option<RiskIndex> =
         store.get_state(&format!("{STATE_RISK_INDEX}:{}", mode.as_str()))?;
     if !index.is_some_and(|i| i.suspicions.contains_key(&symbol)) {
         bail!("No hay un posible cambio de ratio pendiente en {symbol}.");
     }
-    let key = format!("{STATE_RISK_ACCEPT}:{}", mode.as_str());
-    let mut accepted: Vec<String> = store.get_state(&key)?.unwrap_or_default();
-    if !accepted.contains(&symbol) {
-        accepted.push(symbol.clone());
+    let base = match decision {
+        RatioDecision::Ratio => STATE_RISK_RATIO,
+        RatioDecision::Drop => STATE_RISK_DROP,
+    };
+    let key = format!("{base}:{}", mode.as_str());
+    let mut symbols: Vec<String> = store.get_state(&key)?.unwrap_or_default();
+    if !symbols.contains(&symbol) {
+        symbols.push(symbol.clone());
     }
-    store.set_state(&key, &accepted)?;
-    Ok(symbol)
+    store.set_state(&key, &symbols)?;
+    let tripped = store
+        .get_state::<DrawdownState>(&format!("{STATE_DRAWDOWN}:{}", mode.as_str()))?
+        .is_some_and(|d| d.tripped);
+    let what = match decision {
+        RatioDecision::Ratio => {
+            "se tomará como cambio de ratio: se rebasa a la cantidad y el precio de ese momento, sin contar caída ni suba"
+        }
+        RatioDecision::Drop => {
+            "se contará como movimiento real desde la base guardada (si eso confirma la caída máxima, el freno vende las posiciones de riesgo)"
+        }
+    };
+    let when = if tripped {
+        "El freno por caída está activo: no se hacen controles de riesgo, así que se aplica recién en la próxima decisión mensual."
+    } else {
+        "Se aplica en el próximo control de riesgo del servicio (días hábiles, en horario de rueda, cada 15 minutos). No se corrió ningún control ahora."
+    };
+    Ok(format!("Anotado: {symbol} {what}. {when}"))
 }
 
 /// Start of the error raised when the order limits block an execution.
@@ -324,17 +364,21 @@ impl Engine {
         }
     }
 
-    /// The risk index of this mode; a fresh one (level 1.0) when there is none yet.
-    /// Owner acceptance of a pending suspected ratio change (see [`request_ratio_accept`]).
-    pub fn accept_ratio_change(&self, symbol: &str) -> anyhow::Result<String> {
+    /// Owner decision about a pending suspected ratio change (see [`request_ratio_decision`]).
+    pub fn decide_ratio_change(
+        &self,
+        symbol: &str,
+        decision: RatioDecision,
+    ) -> anyhow::Result<String> {
         let mut guard = self
             .deps
             .store
             .lock()
             .map_err(|_| anyhow!("la base de datos quedó en un estado inconsistente"))?;
-        request_ratio_accept(&mut guard, self.exec_mode(), symbol)
+        request_ratio_decision(&mut guard, self.exec_mode(), symbol, decision)
     }
 
+    /// The risk index of this mode; a fresh one (level 1.0) when there is none yet.
     pub(crate) fn load_risk_index(&self) -> anyhow::Result<RiskIndex> {
         let key = self.state_key(STATE_RISK_INDEX);
         Ok(self

@@ -67,7 +67,7 @@ fn command_with(name: &str, args: &str) -> Incoming {
 }
 
 #[tokio::test]
-async fn aceptar_accepts_a_pending_ratio_change_and_reports_errors() {
+async fn ratio_and_caida_only_record_and_never_run_a_risk_check() {
     let h = Harness::live(TradingMode::LiveAuto, dec!(0));
     h.fake().set_position("AAA", dec!(100));
     let index = RiskIndex {
@@ -85,25 +85,47 @@ async fn aceptar_accepts_a_pending_ratio_change_and_reports_errors() {
         .set_state(&key, &index)
         .expect("index");
 
-    let BotAction::Reply(none) = handle_incoming(&h.engine, &command_with("aceptar", "")).await
+    let BotAction::Reply(none) = handle_incoming(&h.engine, &command_with("caida", "")).await
     else {
         panic!("expected a reply");
     };
-    assert!(none.contains("No se pudo aceptar"), "{none}");
-    let BotAction::Reply(wrong) = handle_incoming(&h.engine, &command_with("aceptar", "ZZZ")).await
+    assert!(none.contains("No se pudo anotar"), "{none}");
+    let BotAction::Reply(wrong) = handle_incoming(&h.engine, &command_with("ratio", "ZZZ")).await
     else {
         panic!("expected a reply");
     };
     assert!(wrong.contains("No hay un posible cambio"), "{wrong}");
-    let BotAction::Reply(ok) = handle_incoming(&h.engine, &command_with("aceptar", "aaa")).await
+    let BotAction::Reply(ok) = handle_incoming(&h.engine, &command_with("caida", "aaa")).await
     else {
         panic!("expected a reply");
     };
-    assert!(ok.contains("Aceptado") && ok.contains("AAA"), "{ok}");
-    // The risk check ran right away and counted the (halved) price as a real move.
-    assert!(ok.contains("0.5000"), "{ok}");
+    assert!(ok.contains("Anotado") && ok.contains("AAA"), "{ok}");
+    assert!(ok.contains("No se corrió ningún control"), "{ok}");
+    let BotAction::Reply(ok) = handle_incoming(&h.engine, &command_with("ratio", "aaa")).await
+    else {
+        panic!("expected a reply");
+    };
+    assert!(ok.contains("cambio de ratio"), "{ok}");
+    // Nothing ran: the stored index is untouched and no order went out.
+    let after: RiskIndex = h
+        .store
+        .lock()
+        .expect("lock")
+        .get_state(&key)
+        .expect("get")
+        .expect("index");
+    assert_eq!(after, index);
+    assert!(h.fake().places().is_empty());
+    // The old command is gone and says what to use now.
+    let BotAction::Reply(old) = handle_incoming(&h.engine, &command_with("aceptar", "AAA")).await
+    else {
+        panic!("expected a reply");
+    };
+    assert!(old.contains("/ratio") && old.contains("/caida"), "{old}");
     let help = handle_incoming(&h.engine, &command("ayuda")).await;
-    assert!(matches!(help, BotAction::Reply(t) if t.contains("/aceptar")));
+    assert!(
+        matches!(help, BotAction::Reply(t) if t.contains("/ratio") && t.contains("/caida") && !t.contains("/aceptar"))
+    );
 }
 
 #[tokio::test]

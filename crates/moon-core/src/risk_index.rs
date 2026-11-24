@@ -180,7 +180,7 @@ impl RiskIndex {
                 continue;
             };
             let suspect = self.suspects.get(sym).cloned().or_else(|| {
-                self.suspicions.contains_key(sym).then(|| Suspect {
+                self.suspicions.contains_key(sym).then_some(Suspect {
                     base_qty: *qty,
                     base_price: *prev,
                     k: 0.0,
@@ -225,8 +225,16 @@ impl RiskIndex {
             let price_near_base = (p1 / p0 - 1.0).abs() <= PENDING_RATIO_TOL;
 
             if let Some(s) = suspect {
-                let k = if s.k > 0.0 { s.k } else { kp };
-                let kq_is_k = (kq / k - 1.0).abs() <= SUSPECT_QTY_TOL;
+                // A suspicion saved without its multiplier takes it from the current price move
+                // when that is a real jump (otherwise nothing can match).
+                let k = if s.k > 0.0 {
+                    s.k
+                } else if (kp - 1.0).abs() > 0.5 {
+                    kp
+                } else {
+                    0.0
+                };
+                let kq_is_k = k > 0.0 && (kq / k - 1.0).abs() <= SUSPECT_QTY_TOL;
                 let qty_unchanged = (kq - 1.0).abs() <= SUSPECT_QTY_TOL;
                 if self.ratios.contains(sym) {
                     anomalies.push(anomaly(

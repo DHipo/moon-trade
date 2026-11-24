@@ -261,7 +261,7 @@ impl Engine {
         if let Some(i) = &risk_index {
             for sym in i.suspicions.keys() {
                 lines.push(format!(
-                    "⚠️ Posible cambio de ratio en {sym}: no se cuenta como caída hasta que IOL actualice la tenencia o lo aceptes con /aceptar {sym} (o `moon risk accept {sym}`)"
+                    "⚠️ Posible cambio de ratio en {sym}: no se cuenta como caída y se excluye de los planes. Verificá la relación del CEDEAR en BYMA/IOL: /ratio {sym} si fue un cambio de ratio, /caida {sym} si fue un movimiento real (o `moon risk ratio {sym}` / `moon risk drop {sym}`)"
                 ));
             }
         }

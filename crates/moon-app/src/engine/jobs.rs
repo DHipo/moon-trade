@@ -85,7 +85,7 @@ impl Engine {
         // The risk index is chained at every observation, so the monthly decision sees the
         // current level; the breaker is only re-armed once the monthly was executed or proposed.
         let mut index = self.load_risk_index()?;
-        self.observe_risk(&mut index, &v)?;
+        self.observe_risk(&mut index, &v).await?;
         self.save_risk_index(&index)?;
         let mut drawdown = self.load_drawdown(index.level)?;
 
@@ -323,7 +323,7 @@ impl Engine {
     }
 
     /// Feeds the risk index with the current holdings and USD unit prices (cash is excluded).
-    fn observe_risk(&self, index: &mut RiskIndex, v: &Valuation) -> anyhow::Result<f64> {
+    async fn observe_risk(&self, index: &mut RiskIndex, v: &Valuation) -> anyhow::Result<f64> {
         let holdings: BTreeMap<String, Decimal> = v
             .positions
             .iter()
@@ -335,9 +335,27 @@ impl Engine {
             .iter()
             .map(|p| (p.symbol.clone(), p.price_ars / v.ccl))
             .collect();
-        index
+        let r = index
             .observe(&holdings, &prices, v.at)
-            .map_err(|e| anyhow!("no se pudo actualizar el índice de riesgo: {e}"))
+            .map_err(|e| anyhow!("no se pudo actualizar el índice de riesgo: {e}"))?;
+        // Each anomaly is announced once per symbol and kind per day.
+        let today = self.today();
+        for a in &index.anomalies {
+            let key = self.state_key(&format!("risk_anomaly:{}:{:?}", a.symbol, a.kind));
+            let seen = self.db(|s| s.get_state::<NaiveDate>(&key))?;
+            if seen == Some(today) {
+                continue;
+            }
+            self.db(|s| s.set_state(&key, &today))?;
+            self.deps
+                .notifier
+                .notify(&format!(
+                    "⚠️ Índice de riesgo: {} — {}. No cuenta como caída de mercado.",
+                    a.symbol, a.detail
+                ))
+                .await;
+        }
+        Ok(r)
     }
 
     /// `now + approval_timeout`, capped at today's market close (ART).
@@ -499,8 +517,13 @@ impl Engine {
             anyhow!("No se pudo valuar la cartera: el control de caída no corrió ({e})")
         })?;
         let today = self.today();
-        self.observe_risk(&mut index, &v)?;
-        let signal = drawdown.observe(index.level, today, self.cfg.risk.max_drawdown);
+        self.observe_risk(&mut index, &v).await?;
+        let signal = drawdown.observe_confirmed(
+            index.level,
+            today,
+            self.cfg.risk.max_drawdown,
+            self.cfg.risk.trip_confirmations,
+        );
         self.save_risk_index(&index)?;
         self.save_drawdown(&drawdown)?;
         let dd = drawdown.drawdown(index.level);

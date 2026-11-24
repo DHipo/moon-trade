@@ -413,7 +413,10 @@ mod tests {
         let r = idx.observe(&h, &p, t(5)).unwrap();
         assert!((r + 0.5).abs() < 1e-12);
         assert!((idx.level - 0.5).abs() < 1e-12);
-        assert_eq!(idx.anomalies[0].kind, AnomalyKind::AcceptedAfterConfirmation);
+        assert_eq!(
+            idx.anomalies[0].kind,
+            AnomalyKind::AcceptedAfterConfirmation
+        );
         assert_eq!(idx.prices_usd["A"], dec!(5));
         assert!(idx.suspicions.is_empty());
         // Counted once: afterwards nothing is suspicious.

@@ -48,6 +48,7 @@ fn set_tripped(h: &Harness) {
                 peak_nav: 1.0,
                 tripped: true,
                 tripped_on: Some(TODAY),
+                breaches: 0,
             },
         )
         .expect("state");

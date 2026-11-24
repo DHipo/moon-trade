@@ -494,12 +494,21 @@ mod tests {
             peak_nav: 1.0,
             ..Default::default()
         };
-        assert_eq!(s.observe_confirmed(0.8, day, 0.15, 2), DrawdownSignal::Normal);
+        assert_eq!(
+            s.observe_confirmed(0.8, day, 0.15, 2),
+            DrawdownSignal::Normal
+        );
         assert_eq!(s.breaches, 1);
         // A recovery resets the count.
-        assert_eq!(s.observe_confirmed(0.95, day, 0.15, 2), DrawdownSignal::Normal);
+        assert_eq!(
+            s.observe_confirmed(0.95, day, 0.15, 2),
+            DrawdownSignal::Normal
+        );
         assert_eq!(s.breaches, 0);
-        assert_eq!(s.observe_confirmed(0.8, day, 0.15, 2), DrawdownSignal::Normal);
+        assert_eq!(
+            s.observe_confirmed(0.8, day, 0.15, 2),
+            DrawdownSignal::Normal
+        );
         assert_eq!(
             s.observe_confirmed(0.8, day, 0.15, 2),
             DrawdownSignal::Tripped

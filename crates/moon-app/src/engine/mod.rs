@@ -50,6 +50,9 @@ pub const STATE_EMERGENCY_REFUGE: &str = "emergency_refuge_done";
 pub const STATE_EMERGENCY_UNKNOWN: &str = "emergency_unknown_notified";
 pub const STATE_PAPER_INIT: &str = "paper_initialized";
 
+/// Start of the error raised when the order limits block an execution.
+pub(crate) const ORDER_BLOCKED: &str = "Orden bloqueada por los límites de riesgo";
+
 /// Prefix of the error recorded when `place` failed and the order may exist at the broker.
 pub const UNKNOWN_OUTCOME: &str = "resultado desconocido: verificar en IOL —";
 

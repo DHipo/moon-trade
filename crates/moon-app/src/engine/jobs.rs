@@ -12,7 +12,7 @@ use moon_core::nav::NavTracker;
 use moon_core::rebalance::{PlannedOrder, RebalancePlan};
 use moon_core::risk::{DrawdownSignal, DrawdownState};
 use moon_core::time::{ART, art_datetime};
-use moon_core::types::{DataSource, ExecMode, OrderReason, OrderStatus};
+use moon_core::types::{DataSource, ExecMode, OrderReason, OrderStatus, Side};
 use moon_core::weights::TargetWeights;
 use moon_store::{
     FlowKind, FlowRecord, OrderRecord, PaperAccount, Proposal, ProposalKind, ProposalStatus,
@@ -26,9 +26,10 @@ use uuid::Uuid;
 use super::reconcile::reconcile_positions;
 use super::text::{execution_summary, proposal_text};
 use super::{
-    Engine, ExecutionReport, MonthlyOutcome, PositionValue, RiskOutcome, STATE_DRAWDOWN,
-    STATE_EMERGENCY_REFUGE, STATE_EMERGENCY_UNKNOWN, STATE_FLOWS_CHECKED, STATE_FLOWS_WARNED,
-    STATE_NAV, STATE_PAPER_INIT, UNKNOWN_OUTCOME, Valuation, art_day_bounds, previous_trading_day,
+    Engine, ExecutionReport, MonthlyOutcome, ORDER_BLOCKED, PositionValue, RiskOutcome,
+    STATE_DRAWDOWN, STATE_EMERGENCY_REFUGE, STATE_EMERGENCY_UNKNOWN, STATE_FLOWS_CHECKED,
+    STATE_FLOWS_WARNED, STATE_NAV, STATE_PAPER_INIT, UNKNOWN_OUTCOME, Valuation, art_day_bounds,
+    previous_trading_day,
 };
 use crate::config::TradingMode;
 
@@ -433,6 +434,32 @@ impl Engine {
         if working {
             return Ok(());
         }
+        // A refuge buy whose outcome is unknown may exist at IOL: never send another one.
+        let since = art_day_bounds(marker).0;
+        let until = self.now() + Duration::days(1);
+        let unknown_buy = self
+            .db(|s| s.orders_between(mode, since, until))?
+            .iter()
+            .any(|o| {
+                o.reason == OrderReason::Emergency
+                    && o.asset == refuge
+                    && o.side == Side::Buy
+                    && o.status == OrderStatus::Failed
+                    && o.error
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with(UNKNOWN_OUTCOME))
+            });
+        if unknown_buy {
+            self.db(|s| s.set_state(STATE_EMERGENCY_REFUGE, &marker))?;
+            self.deps
+                .notifier
+                .notify(
+                    "🚨 Freno por caída: la compra del refugio tiene resultado desconocido y NO se reenvía. \
+                     Verificá en IOL si la orden existe y comprá a mano si hace falta.",
+                )
+                .await;
+            return Ok(());
+        }
         let targets = TargetWeights::all_in(refuge.clone());
         let full = self.plan(&targets, &v, true)?;
         let orders: Vec<PlannedOrder> = full
@@ -462,13 +489,19 @@ impl Engine {
             )
             .await;
         match result {
-            // A broker error leaves the marker unset so the next check tries again.
-            Ok(report) if report.errors.is_empty() => {
+            // A definite failure (rejection) leaves the marker unset so the next check retries;
+            // an unknown outcome is caught by the check above.
+            Ok(report)
+                if report.errors.is_empty()
+                    && report.orders.iter().all(|o| {
+                        !matches!(o.status, OrderStatus::Rejected | OrderStatus::Failed)
+                    }) =>
+            {
                 self.db(|s| s.set_state(STATE_EMERGENCY_REFUGE, &marker))?;
             }
             Ok(_) => {}
             // Blocked by the order limits: already notified, retrying would not help.
-            Err(e) if e.to_string().starts_with("Orden bloqueada") => {
+            Err(e) if e.to_string().starts_with(ORDER_BLOCKED) => {
                 self.db(|s| s.set_state(STATE_EMERGENCY_REFUGE, &marker))?;
             }
             Err(e) => return Err(e),

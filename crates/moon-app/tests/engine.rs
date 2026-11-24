@@ -806,8 +806,7 @@ async fn emergency_sell_survives_flow_query_failure() {
     assert_eq!(warned, 1, "warned at most once per hour");
 }
 
-#[tokio::test]
-async fn refuge_buy_is_retried_after_a_broker_error() {
+fn refuge_harness() -> Harness {
     let h = Harness::live_with(TradingMode::LiveAuto, dec!(0), |cfg| {
         cfg.assets = vec![
             moon_core::testutil::spec("AAA", moon_core::asset::Role::Risky),
@@ -817,11 +816,38 @@ async fn refuge_buy_is_retried_after_a_broker_error() {
     });
     arm_breaker(&h);
     h.fake().set_fill_on_place(Some(Some(dec!(0))));
+    h
+}
+
+#[tokio::test]
+async fn refuge_buy_with_unknown_outcome_is_never_resent() {
+    let h = refuge_harness();
     h.fake().set_fail_buys(true);
     h.engine.run_risk_check().await.expect("first check");
     assert_eq!(h.fake().places().len(), 1, "only the sell went through");
 
     h.fake().set_fail_buys(false);
+    for _ in 0..2 {
+        h.engine.run_risk_check().await.expect("next check");
+    }
+    assert_eq!(h.fake().places().len(), 1, "the refuge buy is not re-sent");
+    let notices = h
+        .notifier
+        .messages()
+        .into_iter()
+        .filter(|m| m.contains("compra del refugio tiene resultado desconocido"))
+        .count();
+    assert_eq!(notices, 1);
+}
+
+#[tokio::test]
+async fn rejected_refuge_buy_is_retried() {
+    let h = refuge_harness();
+    h.fake().set_reject_buys(true);
+    h.engine.run_risk_check().await.expect("first check");
+    assert_eq!(h.fake().places().len(), 1, "only the sell went through");
+
+    h.fake().set_reject_buys(false);
     h.engine.run_risk_check().await.expect("second check");
     let places = h.fake().places();
     assert_eq!(places.len(), 2, "{places:?}");

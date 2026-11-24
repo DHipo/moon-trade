@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::reconcile::order_id_for;
 use super::text::execution_summary;
-use super::{Engine, ExecutionReport, UNKNOWN_OUTCOME, art_day_bounds};
+use super::{Engine, ExecutionReport, ORDER_BLOCKED, UNKNOWN_OUTCOME, art_day_bounds};
 
 /// Smallest multiple of `tick` that is `>= price`.
 pub fn ceil_to_tick(price: Decimal, tick: Decimal) -> Decimal {
@@ -75,7 +75,7 @@ impl Engine {
             already,
             emergency,
         ) {
-            let msg = format!("Orden bloqueada por los límites de riesgo: {violation}");
+            let msg = format!("{ORDER_BLOCKED}: {violation}");
             self.deps.notifier.notify(&format!("⛔ {msg}")).await;
             bail!(msg);
         }

@@ -100,6 +100,7 @@ pub struct FakeBroker {
     flows: Mutex<Vec<ExternalFlow>>,
     fail_place: Mutex<bool>,
     fail_buys: Mutex<bool>,
+    reject_buys: Mutex<bool>,
     fail_flows: Mutex<bool>,
     reject_place: Mutex<bool>,
     /// `Some(fees)`: orders fill completely at placement and the account follows.
@@ -126,6 +127,7 @@ impl FakeBroker {
             flows: Mutex::new(Vec::new()),
             fail_place: Mutex::new(false),
             fail_buys: Mutex::new(false),
+            reject_buys: Mutex::new(false),
             fail_flows: Mutex::new(false),
             reject_place: Mutex::new(false),
             fill_on_place: Mutex::new(None),
@@ -152,6 +154,10 @@ impl FakeBroker {
 
     pub fn set_fail_flows(&self, fail: bool) {
         *self.fail_flows.lock().expect("lock") = fail;
+    }
+
+    pub fn set_reject_buys(&self, reject: bool) {
+        *self.reject_buys.lock().expect("lock") = reject;
     }
 
     pub fn set_reject_place(&self, reject: bool) {
@@ -195,7 +201,10 @@ impl Broker for FakeBroker {
         {
             return Err(BrokerError::Broker("timeout de red".into()));
         }
-        if *self.reject_place.lock().expect("lock") {
+        if *self.reject_place.lock().expect("lock")
+            || (*self.reject_buys.lock().expect("lock")
+                && ticket.side == moon_core::types::Side::Buy)
+        {
             return Ok(PlaceResult {
                 broker_order_id: "rejected".into(),
                 accepted: false,

@@ -1,4 +1,5 @@
 pub mod backtest;
+pub mod check;
 pub mod data;
 pub mod init;
 pub mod paper;

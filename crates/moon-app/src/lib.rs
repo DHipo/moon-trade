@@ -7,11 +7,12 @@ pub mod engine;
 pub mod logging;
 pub mod notify;
 pub mod report;
+pub mod scheduler;
+pub mod serve;
+pub mod telegram_bot;
 
-use cli::{Cli, Command, DataCmd, PaperCmd};
+use cli::{CheckCmd, Cli, Command, DataCmd, PaperCmd};
 use config::{AppConfig, load_secrets};
-
-const PENDING: &str = "pendiente (tarea 13)";
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
@@ -61,8 +62,24 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let cfg = AppConfig::load(&cli.config)?;
             commands::pause::run_set_paused(&cfg, &load_secrets(), false).await
         }
-        Command::Serve | Command::Check { .. } => {
-            println!("{PENDING}");
+        Command::Serve => {
+            let cfg = AppConfig::load(&cli.config)?;
+            let (engine, telegram) = commands::build_engine(cfg, &load_secrets())?;
+            serve::serve(std::sync::Arc::new(engine), telegram).await
+        }
+        Command::Check { cmd: CheckCmd::Iol } => {
+            let cfg = AppConfig::load(&cli.config)?;
+            let text = commands::check::check_iol(&cfg, &load_secrets()).await?;
+            println!("{text}");
+            Ok(())
+        }
+        Command::Check {
+            cmd: CheckCmd::Telegram,
+        } => {
+            println!(
+                "{}",
+                commands::check::check_telegram(&load_secrets()).await?
+            );
             Ok(())
         }
     }

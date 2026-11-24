@@ -14,7 +14,7 @@ mod valuation;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail};
-use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc, Weekday};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use moon_broker::{Broker, QuoteSource};
 use moon_core::allocator::{AllocationDecision, Allocator};
 use moon_core::asset::{AssetId, Universe};
@@ -32,6 +32,7 @@ use uuid::Uuid;
 use crate::config::{AppConfig, TradingMode};
 use crate::notify::Notifier;
 
+pub use crate::scheduler::previous_trading_day;
 pub use reconcile::{Discrepancy, order_id_for, reconcile_positions};
 
 pub const STATE_PAUSED: &str = "paused";
@@ -117,17 +118,6 @@ pub struct RiskOutcome {
     pub drawdown: f64,
     pub tripped: bool,
     pub emergency: Option<ExecutionReport>,
-}
-
-/// The last trading day strictly before `date` (Monday to Friday, minus holidays).
-pub fn previous_trading_day(date: NaiveDate, holidays: &[NaiveDate]) -> NaiveDate {
-    let mut d = date;
-    loop {
-        d -= Duration::days(1);
-        if !matches!(d.weekday(), Weekday::Sat | Weekday::Sun) && !holidays.contains(&d) {
-            return d;
-        }
-    }
 }
 
 /// Start and end (inclusive) of an ART calendar day, in UTC.

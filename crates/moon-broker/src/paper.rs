@@ -11,8 +11,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AccountState, Broker, BrokerError, ExternalFlow, OrderProgress, OrderTicket, PlaceResult,
-    QuoteSource,
+    AccountState, Broker, BrokerError, ExternalFlow, Listing, OrderProgress, OrderTicket,
+    PlaceResult, QuoteSource,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +176,7 @@ impl Broker for PaperBroker {
                             filled_qty: ticket.qty,
                             avg_price: Some(fill_price),
                             fees: Some(fees),
+                            listing: Listing::Listed,
                         }),
                     };
                     store.apply_paper_fill(&acct, &state_key, &rec)?;
@@ -190,6 +191,7 @@ impl Broker for PaperBroker {
     async fn refresh(
         &self,
         broker_order_id: &str,
+        _symbol: &str,
         _placed_on: NaiveDate,
     ) -> Result<OrderProgress, BrokerError> {
         let key = broker_order_id
@@ -204,6 +206,7 @@ impl Broker for PaperBroker {
             filled_qty: Decimal::ZERO,
             avg_price: None,
             fees: None,
+            listing: Listing::Listed,
         }))
     }
 

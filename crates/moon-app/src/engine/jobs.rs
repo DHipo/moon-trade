@@ -24,6 +24,7 @@ use rust_decimal::Decimal;
 use serde_json::json;
 use uuid::Uuid;
 
+use super::execution::EmergencyPricing;
 use super::reconcile::reconcile_positions;
 use super::text::{execution_summary, proposal_text};
 use super::{
@@ -36,6 +37,16 @@ use crate::commands::data::fetch_update;
 use crate::config::TradingMode;
 
 const PAPER_ONLY: &str = "Solo disponible en modo paper.";
+
+/// Which attempt of the emergency sell escalation an asset is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SellStep {
+    /// Limit just below the last price with a fresh quote, otherwise market.
+    First,
+    Market,
+    /// Deep limit on the last known quote, fresh or not.
+    DeepLimit,
+}
 
 /// Last time a refuge-buy failure was notified (per mode), to notify at most once per hour.
 const STATE_REFUGE_NOTICE: &str = "emergency_refuge_notified";
@@ -291,11 +302,49 @@ impl Engine {
         }
         let mut lines = Vec::new();
         if !blocked.is_empty() {
-            let names: Vec<String> = blocked.iter().map(ToString::to_string).collect();
-            lines.push(format!(
+            // Name the blocking orders by their short id; those with an unknown outcome can be
+            // resolved by hand.
+            let mode = self.exec_mode();
+            let today = self.today();
+            let since = art_day_bounds(today.with_day(1).unwrap_or(today)).0;
+            let until = self.now() + Duration::days(1);
+            let orders = self
+                .db(|s| s.orders_between(mode, since, until))
+                .unwrap_or_default();
+            let is_unknown = |o: &OrderRecord| {
+                o.status == OrderStatus::Failed
+                    && o.error
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with(UNKNOWN_OUTCOME))
+            };
+            let mut names: Vec<String> = Vec::new();
+            let mut any_unknown = false;
+            for asset in blocked {
+                let blocking: Vec<&OrderRecord> = orders
+                    .iter()
+                    .filter(|o| &o.asset == asset && (!o.status.is_terminal() || is_unknown(o)))
+                    .collect();
+                any_unknown |= blocking.iter().any(|o| is_unknown(o));
+                if blocking.is_empty() {
+                    names.push(asset.to_string());
+                } else {
+                    let ids: Vec<String> = blocking
+                        .iter()
+                        .map(|o| super::text::short_id(o.id))
+                        .collect();
+                    names.push(format!("{asset} (orden {})", ids.join(", ")));
+                }
+            }
+            let mut text = format!(
                 "Se omiten {} porque ya tienen una orden pendiente o con resultado desconocido este mes (verificá en IOL).",
                 names.join(", ")
-            ));
+            );
+            if any_unknown {
+                text.push_str(
+                    " Si ya verificaste una orden con resultado desconocido, registrala con `moon orders resolve <id>`.",
+                );
+            }
+            lines.push(text);
         }
         lines.extend(notes.iter().cloned());
         self.deps
@@ -582,7 +631,8 @@ impl Engine {
         }
         if let Err(e) = self.emergency_refuge_buy(drawdown).await {
             tracing::error!("compra del refugio tras la salida de emergencia: {e}");
-            if !self.refuge_notice_due() {
+            // Refuge-buy failures are notified at most once per hour (the retry happens every check).
+            if !self.notice_due(STATE_REFUGE_NOTICE, Duration::hours(1)) {
                 return;
             }
             self.deps
@@ -594,7 +644,7 @@ impl Engine {
         }
     }
 
-    /// True when the refuge is not CASH and has not been handled yet in this trip.
+    /// True when the refuge is not CASH and has not been bought (or given up on) in this trip.
     fn refuge_pending(&self, drawdown: &DrawdownState) -> anyhow::Result<bool> {
         if self.universe.refuge().id.is_cash() {
             return Ok(false);
@@ -605,23 +655,14 @@ impl Engine {
         Ok(done != Some(marker))
     }
 
-    /// Refuge-buy failures are notified at most once per hour (the retry happens every check).
-    fn refuge_notice_due(&self) -> bool {
-        let key = self.state_key(STATE_REFUGE_NOTICE);
-        let now = self.now();
-        let last: Option<DateTime<Utc>> = self.db(|s| s.get_state(&key)).ok().flatten();
-        if last.is_some_and(|t| now - t < Duration::hours(1)) {
-            return false;
-        }
-        if let Err(e) = self.db(|s| s.set_state(&key, &now)) {
-            tracing::warn!("no se pudo guardar el aviso del refugio: {e}");
-        }
-        true
-    }
-
     /// Sells what is still held in risky assets, once per asset unless an order is already
     /// working or its outcome is unknown. Reads the broker's account directly: it never depends
     /// on quotes or the CCL being available.
+    ///
+    /// The attempts per asset escalate: (1) a limit just below the last price, only with a fresh
+    /// quote, otherwise market; (2) market; (3) after a DEFINITE rejection of a market order, a
+    /// deep limit on the last known quote (fresh or not); then market and deep limit alternate on
+    /// each further definite rejection.
     async fn emergency_sweep(
         &self,
         drawdown: &DrawdownState,
@@ -640,7 +681,7 @@ impl Engine {
             self.deps
                 .notifier
                 .notify(&format!(
-                    "🚨 Freno por caída: órdenes abiertas canceladas.\n• {}",
+                    "🚨 Freno por caída: órdenes abiertas sin cancelar.\n• {}",
                     notes.join("\n• ")
                 ))
                 .await;
@@ -693,13 +734,14 @@ impl Engine {
                 .await;
         }
 
-        // (asset, symbol, qty, force_market)
-        let mut candidates: Vec<(AssetId, String, Decimal, bool)> = Vec::new();
+        let deep_pct =
+            (self.cfg.execution.emergency_deep_limit_discount * Decimal::ONE_HUNDRED).normalize();
+        let mut candidates: Vec<(AssetId, String, Decimal, SellStep)> = Vec::new();
         let mut unknown: Vec<String> = Vec::new();
         for (asset, symbol, qty) in held {
             let mine: Vec<&OrderRecord> = emergency_orders
                 .iter()
-                .filter(|o| o.asset == asset)
+                .filter(|o| o.asset == asset && o.side == Side::Sell)
                 .collect();
             if mine.iter().any(|o| !o.status.is_terminal()) {
                 continue; // still working: leave it
@@ -720,11 +762,43 @@ impl Engine {
                 unknown.push(format!("{symbol} (orden {})", ids.join(", ")));
                 continue; // never re-send an order whose outcome is unknown
             }
-            // A limit order that did not fill (rejected or cancelled) is replaced by a market order.
-            let force_market = mine
+            // The next attempt depends on the last sell that did not fill: after a limit order
+            // (cancelled or rejected) comes market; after a market order that was definitely
+            // rejected comes a deep limit.
+            let last = mine
                 .iter()
-                .any(|o| o.limit_price.is_some() && o.status != OrderStatus::Filled);
-            candidates.push((asset, symbol, qty, force_market));
+                .rev()
+                .copied()
+                .find(|o| o.status != OrderStatus::Filled);
+            let step = match last {
+                None => SellStep::First,
+                Some(o) if o.limit_price.is_some() => SellStep::Market,
+                Some(o) if o.status == OrderStatus::Rejected => SellStep::DeepLimit,
+                Some(_) => SellStep::Market,
+            };
+            if let Some(o) = last
+                && o.status == OrderStatus::Rejected
+                && self.notice_due(
+                    &format!("emergency_reject_notice:{}", o.id),
+                    Duration::days(3650),
+                )
+            {
+                let how = match step {
+                    SellStep::DeepLimit => {
+                        format!("a límite {deep_pct} % por debajo del último precio conocido")
+                    }
+                    _ => "a mercado".to_string(),
+                };
+                self.deps
+                    .notifier
+                    .notify(&format!(
+                        "🚨 Freno por caída: la venta de emergencia de {symbol} (orden {}) fue rechazada por IOL: {}. Se reintenta {how}.",
+                        super::text::short_id(o.id),
+                        o.error.as_deref().unwrap_or("sin detalle")
+                    ))
+                    .await;
+            }
+            candidates.push((asset, symbol, qty, step));
         }
 
         if !unknown.is_empty() {
@@ -744,7 +818,7 @@ impl Engine {
                     .notifier
                     .notify(&format!(
                         "🚨 Freno por caída: la venta de emergencia de {} tiene resultado desconocido y NO se reenvía. \
-                         Verificá en IOL si la orden existe, vendé a mano si hace falta y registrá el resultado con `moon orders resolve`.",
+                         Verificá en IOL si la orden existe, vendé a mano si hace falta y registrá el resultado con `moon orders resolve <id>` (el id va entre paréntesis).",
                         fresh.join(", ")
                     ))
                     .await;
@@ -755,35 +829,52 @@ impl Engine {
         }
 
         let mut orders: Vec<PlannedOrder> = Vec::new();
+        let mut pricing: BTreeMap<AssetId, EmergencyPricing> = BTreeMap::new();
         let now = self.now();
-        for (asset, symbol, qty, force_market) in &candidates {
+        for (asset, symbol, qty, step) in &candidates {
             let market = self
                 .universe
                 .get(asset)
                 .and_then(|a| a.exec.as_ref())
                 .map(|e| e.market);
-            // A fresh quote gives an aggressive limit; without one (or after a limit order that
-            // did not fill) the order goes at market.
-            let ref_price = match market {
-                _ if *force_market => Decimal::ZERO,
-                Some(m) => match self.deps.quotes.quote(symbol, m).await {
-                    Ok(q) if q.price > Decimal::ZERO && q.is_fresh(now) => q.price,
-                    Ok(q) => {
-                        tracing::warn!(
-                            "la cotización de {symbol} no es fresca ({}): la venta de emergencia va a mercado",
-                            q.at
-                        );
-                        Decimal::ZERO
-                    }
+            let quote = match (step, market) {
+                (SellStep::Market, _) | (_, None) => None,
+                (_, Some(m)) => match self.deps.quotes.quote(symbol, m).await {
+                    Ok(q) if q.price > Decimal::ZERO => Some(q),
+                    Ok(_) => None,
                     Err(e) => {
                         tracing::warn!(
                             "sin cotización de {symbol} para la venta de emergencia: {e}"
                         );
-                        Decimal::ZERO
+                        None
                     }
                 },
-                None => Decimal::ZERO,
             };
+            let (choice, ref_price) = match (step, quote) {
+                // A fresh quote gives an aggressive limit; otherwise the order goes at market.
+                (SellStep::First, Some(q)) if q.is_fresh(now) => (
+                    EmergencyPricing::Limit {
+                        discount: self.cfg.execution.emergency_limit_discount,
+                    },
+                    q.price,
+                ),
+                (SellStep::First, Some(q)) => {
+                    tracing::warn!(
+                        "la cotización de {symbol} no es fresca ({}): la venta de emergencia va a mercado",
+                        q.at
+                    );
+                    (EmergencyPricing::Market, Decimal::ZERO)
+                }
+                // The deep limit trusts the last known quote even when it is stale.
+                (SellStep::DeepLimit, Some(q)) => (
+                    EmergencyPricing::Limit {
+                        discount: self.cfg.execution.emergency_deep_limit_discount,
+                    },
+                    q.price,
+                ),
+                _ => (EmergencyPricing::Market, Decimal::ZERO),
+            };
+            pricing.insert(asset.clone(), choice);
             let value = round_money(*qty * ref_price);
             orders.push(PlannedOrder {
                 asset: asset.clone(),
@@ -796,14 +887,26 @@ impl Engine {
             });
         }
         if header.is_none() {
-            let names: Vec<String> = orders.iter().map(|o| o.asset.to_string()).collect();
-            self.deps
-                .notifier
-                .notify(&format!(
-                    "🚨 Freno por caída activo: se reintenta la venta de emergencia de {}.",
-                    names.join(", ")
-                ))
-                .await;
+            // At most once per hour per symbol (the retry runs at every check).
+            let names: Vec<String> = candidates
+                .iter()
+                .filter(|(_, symbol, _, _)| {
+                    self.notice_due(
+                        &format!("emergency_retry_notice:{symbol}"),
+                        Duration::hours(1),
+                    )
+                })
+                .map(|(asset, _, _, _)| asset.to_string())
+                .collect();
+            if !names.is_empty() {
+                self.deps
+                    .notifier
+                    .notify(&format!(
+                        "🚨 Freno por caída activo: se reintenta la venta de emergencia de {}.",
+                        names.join(", ")
+                    ))
+                    .await;
+            }
         }
         let plan = RebalancePlan {
             equity: Decimal::ZERO,
@@ -813,21 +916,17 @@ impl Engine {
         };
         let targets = TargetWeights::all_in(refuge);
         let report = self
-            .execute(
-                &plan,
-                &targets,
-                OrderReason::Emergency,
-                Uuid::new_v4(),
-                true,
-            )
+            .execute_emergency(&plan, &targets, Uuid::new_v4(), &pricing)
             .await?;
         Ok(Some(report))
     }
 
     /// Refreshes every non-terminal emergency order. A still-unfilled emergency LIMIT sell older
-    /// than `emergency_reprice_minutes` is cancelled so the sweep re-sends it at market for what is
-    /// still held. Orders without a broker id or whose cancel failed are left alone (never
-    /// duplicated). Returns notes for the owner.
+    /// than `emergency_reprice_minutes` is cancelled; only when the refreshed state CONFIRMS it
+    /// is over (cancelled or rejected) does the sweep re-send what is still held. If the cancel
+    /// is not confirmed the order is left as it is (it may still fill) and retried at the next
+    /// check, so two sells are never alive at once. Orders without a broker id are left alone.
+    /// Returns notes for the owner.
     async fn reprice_emergency_orders(&self) -> anyhow::Result<Vec<String>> {
         let mode = self.exec_mode();
         let window = Duration::minutes(i64::from(self.cfg.execution.emergency_reprice_minutes));
@@ -841,7 +940,7 @@ impl Engine {
             let Some(broker_id) = order.broker_order_id.clone() else {
                 continue;
             };
-            if let Err(e) = self.refresh_order(&mut order).await {
+            if let Err(e) = self.refresh_emergency_order(&mut order).await {
                 tracing::warn!(
                     "no se pudo actualizar la orden de emergencia {}: {e}",
                     order.id
@@ -855,33 +954,58 @@ impl Engine {
             if !stale {
                 continue;
             }
-            if let Err(e) = self.deps.broker.cancel(&broker_id).await {
-                notes.push(format!(
-                    "No se pudo cancelar la venta de {} a límite: {e}. Sigue vigente y no se reenvía.",
-                    order.symbol
-                ));
-                continue;
-            }
-            if let Err(e) = self.refresh_order(&mut order).await {
+            let id = super::text::short_id(order.id);
+            let cancel = self.deps.broker.cancel(&broker_id).await;
+            // Act only on the refreshed state, whatever the cancel call said.
+            let refreshed = self.refresh_emergency_order(&mut order).await;
+            if let Err(e) = &refreshed {
                 tracing::warn!(
-                    "no se pudo actualizar la orden de emergencia {}: {e}",
+                    "no se pudo actualizar la orden de emergencia {} tras cancelarla: {e}",
                     order.id
                 );
             }
-            if !order.status.is_terminal() {
-                order.status = OrderStatus::Cancelled;
-                order.updated_at = self.now();
-                self.db(|s| s.update_order(&order))?;
+            if refreshed.is_ok()
+                && matches!(order.status, OrderStatus::Cancelled | OrderStatus::Rejected)
+            {
+                notes.push(format!(
+                    "La venta de {} a límite (orden {id}) no se ejecutó en {} minutos: IOL confirmó la cancelación y se reenvía a mercado lo que queda.",
+                    order.symbol, self.cfg.execution.emergency_reprice_minutes
+                ));
+                continue;
             }
-            notes.push(format!(
-                "La venta de {} a límite no se ejecutó en {} minutos: se cancela y se reenvía a mercado.",
-                order.symbol, self.cfg.execution.emergency_reprice_minutes
-            ));
+            if refreshed.is_ok() && order.status.is_terminal() {
+                continue; // filled meanwhile: recorded and notified, nothing to re-send
+            }
+            // Not confirmed: never re-send, retry at the next check.
+            match cancel {
+                Err(e) => {
+                    if self.notice_due(
+                        &format!("emergency_cancel_notice:{}", order.symbol),
+                        Duration::hours(1),
+                    ) {
+                        notes.push(format!(
+                            "No se pudo cancelar la venta de {} a límite (orden {id}): {e}. Sigue vigente y no se reenvía; se reintenta en el próximo control.",
+                            order.symbol
+                        ));
+                    }
+                }
+                Ok(()) => {
+                    if self.notice_due(
+                        &format!("emergency_cancel_unconfirmed_notice:{}", order.id),
+                        Duration::hours(1),
+                    ) {
+                        notes.push(format!(
+                            "La cancelación de la venta de {} a límite (orden {id}) no está confirmada por IOL: sigue vigente y no se reenvía; se reintenta en el próximo control.",
+                            order.symbol
+                        ));
+                    }
+                }
+            }
         }
         Ok(notes)
     }
 
-    /// Polls the working emergency orders until none is left or `emergency_fill_wait_seconds`
+    /// Polls the working emergency SELL orders until none is left or `emergency_fill_wait_seconds`
     /// pass, so the refuge can be bought in the same risk check.
     async fn wait_for_emergency_fills(&self) {
         let wait = std::time::Duration::from_secs(u64::from(
@@ -896,7 +1020,11 @@ impl Engine {
             let working: Vec<OrderRecord> = match self.db(|s| s.open_orders(mode)) {
                 Ok(v) => v
                     .into_iter()
-                    .filter(|o| o.reason == OrderReason::Emergency && o.broker_order_id.is_some())
+                    .filter(|o| {
+                        o.reason == OrderReason::Emergency
+                            && o.side == Side::Sell
+                            && o.broker_order_id.is_some()
+                    })
                     .collect(),
                 Err(e) => {
                     tracing::warn!("no se pudieron leer las órdenes de emergencia: {e}");
@@ -909,15 +1037,18 @@ impl Engine {
             }
             tokio::time::sleep(poll.min(wait - elapsed)).await;
             for mut o in working {
-                if let Err(e) = self.refresh_order(&mut o).await {
+                if let Err(e) = self.refresh_emergency_order(&mut o).await {
                     tracing::warn!("no se pudo actualizar la orden {}: {e}", o.id);
                 }
             }
         }
     }
 
-    /// With a non-CASH refuge: once nothing risky is held and no emergency order is working,
-    /// buys the refuge once per trip, within the normal order limits.
+    /// With a non-CASH refuge: once nothing risky is held and no emergency order is working, buys
+    /// the refuge within the normal order limits. The trip is marked "refuge done" only when the
+    /// refuge is HELD (a buy filled, or nothing left to buy); a buy that is merely sent, or was
+    /// cancelled or rejected, is retried at the next check, the next trading day included. When
+    /// the sells filled but their cash is not credited yet, it waits and retries.
     async fn emergency_refuge_buy(&self, drawdown: &DrawdownState) -> anyhow::Result<()> {
         let refuge = self.universe.refuge().id.clone();
         if refuge.is_cash() {
@@ -948,31 +1079,38 @@ impl Engine {
             .iter()
             .any(|o| o.reason == OrderReason::Emergency);
         if working {
-            return Ok(());
+            return Ok(()); // refreshed by the sweep at every check
         }
-        // A refuge buy whose outcome is unknown may exist at IOL: never send another one.
         let since = art_day_bounds(marker).0;
         let until = self.now() + Duration::days(1);
-        let unknown_buy = self
+        let trip_orders: Vec<OrderRecord> = self
             .db(|s| s.orders_between(mode, since, until))?
+            .into_iter()
+            .filter(|o| o.reason == OrderReason::Emergency)
+            .collect();
+        // A refuge buy whose outcome is unknown may exist at IOL: never send another one.
+        let unknown_ids: Vec<String> = trip_orders
             .iter()
-            .any(|o| {
-                o.reason == OrderReason::Emergency
-                    && o.asset == refuge
+            .filter(|o| {
+                o.asset == refuge
                     && o.side == Side::Buy
                     && o.status == OrderStatus::Failed
                     && o.error
                         .as_deref()
                         .is_some_and(|e| e.starts_with(UNKNOWN_OUTCOME))
-            });
-        if unknown_buy {
+            })
+            .map(|o| super::text::short_id(o.id))
+            .collect();
+        if !unknown_ids.is_empty() {
             self.db(|s| s.set_state(&refuge_key, &marker))?;
             self.deps
                 .notifier
-                .notify(
-                    "🚨 Freno por caída: la compra del refugio tiene resultado desconocido y NO se reenvía. \
-                     Verificá en IOL si la orden existe y comprá a mano si hace falta.",
-                )
+                .notify(&format!(
+                    "🚨 Freno por caída: la compra del refugio tiene resultado desconocido (orden {}) y NO se reenvía. \
+                     Verificá en IOL si la orden existe, comprá a mano si hace falta y registrá el resultado con `moon orders resolve {}`.",
+                    unknown_ids.join(", "),
+                    unknown_ids[0]
+                ))
                 .await;
             return Ok(());
         }
@@ -985,7 +1123,33 @@ impl Engine {
             .cloned()
             .collect();
         if orders.is_empty() {
-            // Nothing to buy (already invested or no cash): done for this trip.
+            // Nothing to buy. That is "done" only if the refuge is held (or never was money);
+            // when the sells filled but their cash is not visible yet, wait and retry.
+            let sold: Decimal = trip_orders
+                .iter()
+                .filter(|o| o.side == Side::Sell && o.filled_qty > Decimal::ZERO)
+                .filter_map(|o| o.avg_fill_price.map(|p| round_money(o.filled_qty * p)))
+                .sum();
+            let refuge_value: Decimal = v
+                .positions
+                .iter()
+                .filter(|p| p.asset == refuge)
+                .map(|p| p.value_ars)
+                .sum();
+            let credited = v.cash_ars + refuge_value;
+            if sold > Decimal::ZERO && credited * Decimal::TWO < sold {
+                if self.notice_due("emergency_refuge_waiting_notice", Duration::days(1)) {
+                    self.deps
+                        .notifier
+                        .notify(&format!(
+                            "🚨 Freno por caída: esperando acreditación del efectivo de las ventas (vendido ARS {}, disponible ARS {}) para comprar el refugio {refuge}. Se reintenta en el próximo control.",
+                            sold.round_dp(2),
+                            v.cash_ars.round_dp(2)
+                        ))
+                        .await;
+                }
+                return Ok(());
+            }
             return self.db(|s| s.set_state(&refuge_key, &marker));
         }
         let plan = RebalancePlan {
@@ -1000,17 +1164,19 @@ impl Engine {
             .execute_refuge_buy(&plan, &targets, Uuid::new_v4())
             .await;
         match result {
-            // A definite failure (rejection) leaves the marker unset so the next check retries;
-            // an unknown outcome is caught by the check above.
-            Ok(report)
-                if report.errors.is_empty()
-                    && report.orders.iter().all(|o| {
-                        !matches!(o.status, OrderStatus::Rejected | OrderStatus::Failed)
-                    }) =>
-            {
-                self.db(|s| s.set_state(&refuge_key, &marker))?;
+            // Held only when every order filled. Sent, cancelled or rejected buys leave the
+            // marker unset so the next check retries (an unknown outcome is caught above).
+            Ok(report) => {
+                let held = report.errors.is_empty()
+                    && !report.orders.is_empty()
+                    && report
+                        .orders
+                        .iter()
+                        .all(|o| o.status == OrderStatus::Filled);
+                if held {
+                    self.db(|s| s.set_state(&refuge_key, &marker))?;
+                }
             }
-            Ok(_) => {}
             // Blocked by the order limits: already notified, retrying would not help.
             Err(e) if e.to_string().starts_with(ORDER_BLOCKED) => {
                 self.db(|s| s.set_state(&refuge_key, &marker))?;
@@ -1368,8 +1534,10 @@ impl Engine {
         problems
     }
 
-    /// Cancels every non-terminal order (only the non-emergency ones when `only_non_emergency`),
-    /// then refreshes it. Returns notes about what was cancelled or could not be.
+    /// Cancels every non-terminal order (only the non-emergency ones when `only_non_emergency`)
+    /// and then refreshes it: an order only becomes `Cancelled` (or filled, or rejected) when the
+    /// refreshed state from the broker says so. Returns notes about what could not be cancelled
+    /// or confirmed (at most once per hour per order).
     async fn cancel_open_orders(&self, only_non_emergency: bool) -> anyhow::Result<Vec<String>> {
         let mode = self.exec_mode();
         let mut notes = Vec::new();
@@ -1377,6 +1545,7 @@ impl Engine {
             if only_non_emergency && order.reason == OrderReason::Emergency {
                 continue;
             }
+            let id = super::text::short_id(order.id);
             let Some(broker_id) = order.broker_order_id.clone() else {
                 order.status = OrderStatus::Failed;
                 order.error = Some(format!(
@@ -1385,29 +1554,37 @@ impl Engine {
                 order.updated_at = self.now();
                 self.db(|s| s.update_order(&order))?;
                 notes.push(format!(
-                    "La orden de {} no tiene identificador del broker: verificá en IOL.",
+                    "La orden {id} de {} no tiene identificador del broker: verificá en IOL y registrá el resultado con `moon orders resolve {id}`.",
                     order.symbol
                 ));
                 continue;
             };
-            let cancelled = self.deps.broker.cancel(&broker_id).await;
-            if let Err(e) = &cancelled {
-                notes.push(format!(
-                    "No se pudo cancelar la orden de {}: {e}",
+            let cancel = self.deps.broker.cancel(&broker_id).await;
+            let refreshed = if order.reason == OrderReason::Emergency {
+                self.refresh_emergency_order(&mut order).await
+            } else {
+                self.refresh_order(&mut order).await
+            };
+            if refreshed.is_ok() && order.status.is_terminal() {
+                continue; // confirmed by the broker (cancelled, rejected or filled meanwhile)
+            }
+            if !self.notice_due(&format!("cancel_notice:{}", order.id), Duration::hours(1)) {
+                continue;
+            }
+            notes.push(match (&cancel, &refreshed) {
+                (_, Err(e)) => format!(
+                    "No se pudo confirmar la cancelación de la orden {id} de {}: {e}. Se reintenta.",
                     order.symbol
-                ));
-            }
-            if let Err(e) = self.refresh_order(&mut order).await {
-                notes.push(format!(
-                    "No se pudo actualizar la orden de {}: {e}",
+                ),
+                (Err(e), Ok(())) => format!(
+                    "No se pudo cancelar la orden {id} de {}: {e}. Sigue vigente; se reintenta.",
                     order.symbol
-                ));
-            }
-            if cancelled.is_ok() && !order.status.is_terminal() {
-                order.status = OrderStatus::Cancelled;
-                order.updated_at = self.now();
-                self.db(|s| s.update_order(&order))?;
-            }
+                ),
+                (Ok(()), Ok(())) => format!(
+                    "La cancelación de la orden {id} de {} no está confirmada por IOL: sigue vigente; se reintenta.",
+                    order.symbol
+                ),
+            });
         }
         Ok(notes)
     }

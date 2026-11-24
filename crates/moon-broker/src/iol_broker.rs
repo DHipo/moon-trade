@@ -11,8 +11,8 @@ use moon_store::FlowKind;
 use rust_decimal::Decimal;
 
 use crate::{
-    AccountState, Broker, BrokerError, ExternalFlow, OrderProgress, OrderTicket, PlaceResult,
-    parse_currency,
+    AccountState, Broker, BrokerError, ExternalFlow, Listing, OrderProgress, OrderTicket,
+    PlaceResult, parse_currency,
 };
 
 /// Adapter over the real IOL API. Every order placed here is REAL.
@@ -20,9 +20,6 @@ pub struct IolBroker {
     client: Arc<IolClient>,
     term: Term,
     clock: Arc<dyn Clock>,
-    /// Symbol of each order placed by this process, so `refresh` can narrow the query.
-    /// Unknown after a restart: `refresh` then queries without the symbol filter.
-    symbols: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl IolBroker {
@@ -31,18 +28,7 @@ impl IolBroker {
             client,
             term,
             clock,
-            symbols: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
-    }
-
-    fn remember_symbol(&self, order_id: &str, symbol: &str) {
-        if let Ok(mut m) = self.symbols.lock() {
-            m.insert(order_id.to_string(), symbol.to_string());
-        }
-    }
-
-    fn symbol_of(&self, order_id: &str) -> Option<String> {
-        self.symbols.lock().ok()?.get(order_id).cloned()
     }
 }
 
@@ -146,9 +132,6 @@ impl Broker for IolBroker {
             // Timeouts, 5xx, 408/409/429 and unparsable replies: the outcome is unknown.
             Err(e) => return Err(err(e)),
         };
-        if ack.successful_purchase && !ack.order_id.is_empty() {
-            self.remember_symbol(&ack.order_id, &ticket.symbol);
-        }
         Ok(PlaceResult {
             broker_order_id: ack.order_id,
             accepted: ack.successful_purchase,
@@ -160,6 +143,7 @@ impl Broker for IolBroker {
     async fn refresh(
         &self,
         broker_order_id: &str,
+        symbol: &str,
         placed_on: NaiveDate,
     ) -> Result<OrderProgress, BrokerError> {
         let page = self
@@ -168,22 +152,28 @@ impl Broker for IolBroker {
                 start_date: placed_on,
                 end_date: art_date(self.clock.now()),
                 country: Some("AR".into()),
-                symbol: self.symbol_of(broker_order_id),
+                symbol: Some(symbol.to_string()).filter(|s| !s.is_empty()),
                 state: None,
             })
             .await
             .map_err(err)?;
-        if let Some(total) = page.total_count
-            && total > page.items.len() as u64
-        {
+        let truncated = page
+            .total_count
+            .is_some_and(|total| total > page.items.len() as u64);
+        if truncated {
             tracing::warn!(
                 order_id = broker_order_id,
                 returned = page.items.len(),
-                total_count = total,
+                total_count = page.total_count,
                 "IOL devolvió menos operaciones que su total; la lista puede estar truncada"
             );
         }
         let found = page.items.iter().find(|o| o.order_id == broker_order_id);
+        let listing = match (found.is_some(), truncated) {
+            (true, _) => Listing::Listed,
+            (false, false) => Listing::NotListed,
+            (false, true) => Listing::NotListedTruncated,
+        };
         let (mut qty, price) = found
             .and_then(|o| o.executed.as_ref())
             .map(|e| (e.qty.unwrap_or(0.0), e.price.unwrap_or(0.0)))
@@ -221,15 +211,27 @@ impl Broker for IolBroker {
             filled_qty: dec(qty)?,
             avg_price: (price > 0.0).then(|| dec(price)).transpose()?,
             fees: None,
+            listing,
         })
     }
 
     async fn cancel(&self, broker_order_id: &str) -> Result<(), BrokerError> {
-        self.client
+        let reply = self
+            .client
             .cancel_order(broker_order_id)
             .await
-            .map(|_| ())
-            .map_err(err)
+            .map_err(err)?;
+        let confirmed = reply.cancelled
+            || reply.status.as_deref().is_some_and(|s| {
+                s.eq_ignore_ascii_case("cancelled") || s.eq_ignore_ascii_case("canceled")
+            });
+        if confirmed {
+            Ok(())
+        } else {
+            Err(BrokerError::Broker(format!(
+                "IOL no confirmó la cancelación de la orden {broker_order_id}"
+            )))
+        }
     }
 
     async fn external_flows(

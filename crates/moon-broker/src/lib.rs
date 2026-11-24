@@ -19,7 +19,10 @@ use uuid::Uuid;
 pub use fx::{FxComponent, FxPair, FxQuote, implied_ccl};
 pub use iol_broker::IolBroker;
 pub use paper::PaperBroker;
-pub use quotes::{IolQuotes, Quote, QuoteSource, StaticQuotes, YahooQuotes, parse_currency};
+pub use quotes::{
+    IolQuotes, Quote, QuoteSource, StaticQuotes, YahooQuotes, is_fresh_at, parse_currency,
+    parse_quote_time,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrokerError {
@@ -63,12 +66,26 @@ pub struct OrderTicket {
     pub settlement_term: Term,
 }
 
+/// Whether the broker's order list contained the order that was refreshed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Listing {
+    /// The order was found (or the broker has no such notion, e.g. paper).
+    #[default]
+    Listed,
+    /// The list did not include the order.
+    NotListed,
+    /// The list did not include the order and the broker's list was truncated.
+    NotListedTruncated,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderProgress {
     pub status: OrderStatus,
     pub filled_qty: Decimal,
     pub avg_price: Option<Decimal>,
     pub fees: Option<Decimal>,
+    #[serde(default)]
+    pub listing: Listing,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -92,11 +109,16 @@ pub trait Broker: Send + Sync {
     fn mode(&self) -> ExecMode;
     async fn account(&self) -> Result<AccountState, BrokerError>;
     async fn place(&self, ticket: &OrderTicket) -> Result<PlaceResult, BrokerError>;
+    /// Current state of an order. `symbol` is the symbol the order was placed with (persisted by
+    /// the caller, so it survives restarts) and narrows the broker's operations query.
     async fn refresh(
         &self,
         broker_order_id: &str,
+        symbol: &str,
         placed_on: NaiveDate,
     ) -> Result<OrderProgress, BrokerError>;
+    /// Requests the cancellation. `Ok` only when the broker CONFIRMS it; callers still `refresh`
+    /// before acting on the outcome.
     async fn cancel(&self, broker_order_id: &str) -> Result<(), BrokerError>;
     async fn external_flows(
         &self,

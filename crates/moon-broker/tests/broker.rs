@@ -171,12 +171,12 @@ async fn paper_place_is_idempotent() {
     assert_eq!(r1.broker_order_id, format!("paper-{}", t.idempotency_key));
     assert_eq!(b.account().await.unwrap().cash_ars, dec!(898689.97));
     let p = b
-        .refresh(&r1.broker_order_id, d(2026, 11, 23))
+        .refresh(&r1.broker_order_id, "SPY", d(2026, 11, 23))
         .await
         .unwrap();
     assert_eq!(p.status, OrderStatus::Filled);
     assert!(matches!(
-        b.refresh("paper-nope", d(2026, 11, 23)).await,
+        b.refresh("paper-nope", "SPY", d(2026, 11, 23)).await,
         Err(BrokerError::NotFound(_))
     ));
     assert!(b.cancel("x").await.is_ok());
@@ -435,14 +435,14 @@ async fn iol_refresh_guards_inconsistent_completions() {
         .mount(&server)
         .await;
     let from = d(2026, 11, 20);
-    let p = b.refresh("nofill", from).await.unwrap();
+    let p = b.refresh("nofill", "SPY", from).await.unwrap();
     assert_eq!(p.status, OrderStatus::Sent);
     assert_eq!(p.filled_qty, dec!(0));
     assert_eq!(
-        b.refresh("zero", from).await.unwrap().status,
+        b.refresh("zero", "SPY", from).await.unwrap().status,
         OrderStatus::Sent
     );
-    let p = b.refresh("31", from).await.unwrap();
+    let p = b.refresh("31", "SPY", from).await.unwrap();
     assert_eq!(p.status, OrderStatus::Filled);
     assert_eq!(p.filled_qty, dec!(10));
 }
@@ -469,7 +469,7 @@ async fn iol_refresh_status_mapping() {
     let from = d(2026, 11, 20);
     let get = |id: &'static str| {
         let b = &b;
-        async move { b.refresh(id, from).await.unwrap() }
+        async move { b.refresh(id, "SPY", from).await.unwrap() }
     };
     let c = get("c").await;
     assert_eq!(c.status, OrderStatus::Filled);
@@ -485,23 +485,15 @@ async fn iol_refresh_status_mapping() {
     assert_eq!(get("x").await.status, OrderStatus::Cancelled);
     assert_eq!(get("r").await.status, OrderStatus::Rejected);
     assert_eq!(get("w").await.status, OrderStatus::Sent);
-    assert_eq!(get("missing").await.status, OrderStatus::Sent);
-}
-
-async fn mount_place(server: &MockServer, order_id: &str) {
-    Mock::given(method("POST"))
-        .and(path("/broker/orders"))
-        .respond_with(ResponseTemplate::new(201).set_body_json(envelope(json!({
-            "order_id": order_id, "successful_purchase": true, "messages": []
-        }))))
-        .mount(server)
-        .await;
+    let missing = get("missing").await;
+    assert_eq!(missing.status, OrderStatus::Sent);
+    assert_eq!(missing.listing, Listing::NotListed);
+    assert_eq!(c.listing, Listing::Listed);
 }
 
 #[tokio::test]
-async fn iol_refresh_narrows_query_by_symbol_of_placed_order() {
+async fn iol_refresh_narrows_query_by_the_persisted_symbol() {
     let (server, b) = iol_server().await;
-    mount_place(&server, "55").await;
     Mock::given(method("GET"))
         .and(path("/broker/accounts/activities/operations"))
         .and(query_param("symbol", "SPY"))
@@ -514,13 +506,13 @@ async fn iol_refresh_narrows_query_by_symbol_of_placed_order() {
         .expect(1)
         .mount(&server)
         .await;
-    b.place(&ticket(Side::Buy, dec!(3), None)).await.unwrap();
-    let p = b.refresh("55", d(2026, 11, 20)).await.unwrap();
+    // No `place` in this process (e.g. after a restart): the symbol comes from the caller.
+    let p = b.refresh("55", "SPY", d(2026, 11, 20)).await.unwrap();
     assert_eq!(p.status, OrderStatus::Filled);
 }
 
 #[tokio::test]
-async fn iol_refresh_without_known_symbol_queries_unfiltered() {
+async fn iol_refresh_with_an_empty_symbol_queries_unfiltered() {
     let (server, b) = iol_server().await;
     Mock::given(method("GET"))
         .and(path("/broker/accounts/activities/operations"))
@@ -529,7 +521,7 @@ async fn iol_refresh_without_known_symbol_queries_unfiltered() {
         ]))))
         .mount(&server)
         .await;
-    let p = b.refresh("9", d(2026, 11, 20)).await.unwrap();
+    let p = b.refresh("9", "", d(2026, 11, 20)).await.unwrap();
     assert_eq!(p.status, OrderStatus::Cancelled);
     let reqs = server.received_requests().await.unwrap();
     let ops_req = reqs
@@ -555,12 +547,14 @@ async fn iol_refresh_truncated_list_without_the_order_stays_sent() {
         })))
         .mount(&server)
         .await;
-    let p = b.refresh("lost", d(2026, 11, 20)).await.unwrap();
+    let p = b.refresh("lost", "SPY", d(2026, 11, 20)).await.unwrap();
     assert_eq!(p.status, OrderStatus::Sent);
     assert_eq!(p.filled_qty, dec!(0));
+    assert_eq!(p.listing, Listing::NotListedTruncated);
     // An order that is present in a truncated list still resolves normally.
-    let p = b.refresh("other", d(2026, 11, 20)).await.unwrap();
+    let p = b.refresh("other", "SPY", d(2026, 11, 20)).await.unwrap();
     assert_eq!(p.status, OrderStatus::Cancelled);
+    assert_eq!(p.listing, Listing::Listed);
 }
 
 #[tokio::test]
@@ -575,6 +569,43 @@ async fn iol_cancel_calls_delete() {
         .mount(&server)
         .await;
     b.cancel("77").await.unwrap();
+}
+
+#[tokio::test]
+async fn iol_cancel_without_confirmation_is_an_error() {
+    for body in [
+        json!({"order_id": "78", "cancelled": false}),
+        json!({"order_id": "78", "status": "pending", "cancelled": false}),
+        json!({"order_id": "78"}),
+    ] {
+        let (server, b) = iol_server().await;
+        Mock::given(method("DELETE"))
+            .and(path("/broker/orders/78"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(envelope(body.clone())))
+            .expect(1)
+            .mount(&server)
+            .await;
+        match b.cancel("78").await {
+            Err(BrokerError::Broker(m)) => {
+                assert!(m.contains("no confirmó la cancelación"), "{m}");
+                assert!(m.contains("78"), "{m}");
+            }
+            other => panic!("{body}: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn iol_cancel_confirmed_by_status_alone_is_ok() {
+    let (server, b) = iol_server().await;
+    Mock::given(method("DELETE"))
+        .and(path("/broker/orders/79"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!({
+            "order_id": "79", "status": "cancelled"
+        }))))
+        .mount(&server)
+        .await;
+    b.cancel("79").await.unwrap();
 }
 
 #[tokio::test]

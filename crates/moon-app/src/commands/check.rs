@@ -6,9 +6,10 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, anyhow};
 use chrono::{Duration, NaiveDate, Utc};
-use moon_broker::{IolQuotes, QuoteSource, implied_ccl};
+use moon_broker::{IolQuotes, QuoteSource, implied_ccl, is_fresh_at, parse_quote_time};
 use moon_core::asset::Market;
-use moon_core::time::{SystemClock, art_date};
+use moon_core::time::{SystemClock, art_date, art_datetime};
+use moon_core::types::Term;
 use moon_iol::{Country, IolClient, IolCredentials, OperationsQuery, TermAmounts};
 use moon_telegram::TelegramClient;
 
@@ -34,6 +35,38 @@ pub async fn check_iol(cfg: &AppConfig, secrets: &Secrets) -> anyhow::Result<Str
         Arc::new(SystemClock),
     ));
     iol_report(&client, cfg, art_date(Utc::now())).await
+}
+
+/// One line about the time stamp of a quote: the raw `last_updated`, the time read in ART and
+/// whether the engine would treat the quote as fresh (the condition for an emergency limit
+/// price). Lets the owner verify IOL's format and meaning before trading live.
+async fn quote_timing_line(client: &IolClient, symbol: &str, market: Market, term: Term) -> String {
+    let q = match client.quote(symbol, market, term).await {
+        Ok(q) => q,
+        Err(e) => return format!("   • {symbol}: ⚠️ no se pudo leer la cotización ({e})"),
+    };
+    let now = Utc::now();
+    let last = q.prices.current.filter(|v| *v > 0.0);
+    let raw = q.last_updated.as_deref();
+    let parsed = raw.and_then(parse_quote_time);
+    let shown_time = parsed.map_or_else(
+        || "no se pudo interpretar".to_string(),
+        |t| art_datetime(t).format("%Y-%m-%d %H:%M:%S ART").to_string(),
+    );
+    let verdict = match (last, parsed) {
+        (None, _) => "NO fresca (sin último precio: se usaría el cierre)".to_string(),
+        (Some(_), None) => "NO fresca (last_updated ausente o ilegible)".to_string(),
+        (Some(_), Some(t)) if is_fresh_at(t, now) => "fresca".to_string(),
+        (Some(_), Some(t)) => format!(
+            "NO fresca (tiene {} min o es de otro día)",
+            (now - t).num_minutes()
+        ),
+    };
+    format!(
+        "   • {symbol}: último {:?} · last_updated crudo {} · interpretado {shown_time} · {verdict}",
+        q.prices.current,
+        raw.map_or_else(|| "(ausente)".to_string(), |r| format!("«{r}»"))
+    )
 }
 
 fn amount(v: Option<f64>) -> String {
@@ -182,6 +215,15 @@ pub async fn iol_report(
                 "✅ Cotización {} ({}): último {:?}",
                 exec.symbol, a.id, quote.prices.current
             ));
+            lines.push(
+                quote_timing_line(
+                    client,
+                    &exec.symbol,
+                    exec.market,
+                    cfg.execution.settlement_term,
+                )
+                .await,
+            );
         }
         None => lines.push("⚠️ No hay activos operables configurados para cotizar.".to_string()),
     }
@@ -204,6 +246,14 @@ pub async fn iol_report(
             show(&adr),
             p.ratio
         ));
+        for (symbol, market) in [
+            (&p.local_symbol, Market::Bcba),
+            (&p.adr_symbol, p.adr_market),
+        ] {
+            lines.push(
+                quote_timing_line(client, symbol, market, cfg.execution.settlement_term).await,
+            );
+        }
     }
     match implied_ccl(&quotes, &cfg.fx.pairs, cfg.fx.min_pairs, Utc::now()).await {
         Ok(fx) => {

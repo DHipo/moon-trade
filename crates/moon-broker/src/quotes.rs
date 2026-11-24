@@ -28,26 +28,36 @@ impl Quote {
     /// True when the quote is at most 30 minutes old and from the same ART day as `now`.
     /// A quote stamped in the future (clock skew) counts as fresh when it is from today.
     pub fn is_fresh(&self, now: DateTime<Utc>) -> bool {
-        now - self.at <= Duration::minutes(FRESH_QUOTE_MAX_AGE_MINUTES)
-            && art_date(self.at) == art_date(now)
+        is_fresh_at(self.at, now)
     }
 }
 
-/// Parses the `last_updated` stamp of an IOL quote: RFC 3339, or a naive date-time or a bare
-/// date interpreted in ART. Returns `None` when it cannot be read.
+/// Freshness rule of [`Quote::is_fresh`] for a bare timestamp.
+pub fn is_fresh_at(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now - at <= Duration::minutes(FRESH_QUOTE_MAX_AGE_MINUTES) && art_date(at) == art_date(now)
+}
+
+/// Parses the `last_updated` stamp of an IOL quote. RFC 3339 keeps its offset; naive date-times
+/// (`2026-11-23T12:00:00[.fff]`, `2026-11-23 12:00:00`, `23/11/2026 12:00:00`) and bare dates
+/// (`2026-11-23`, `23/11/2026`) are interpreted in ART. Returns `None` when it cannot be read.
 pub fn parse_quote_time(raw: &str) -> Option<DateTime<Utc>> {
     let raw = raw.trim();
     if let Ok(t) = DateTime::parse_from_rfc3339(raw) {
         return Some(t.with_timezone(&Utc));
     }
-    let naive = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"]
-        .iter()
-        .find_map(|f| NaiveDateTime::parse_from_str(raw, f).ok())
-        .or_else(|| {
-            NaiveDate::parse_from_str(raw, "%Y-%m-%d")
-                .ok()
-                .and_then(|d| d.and_hms_opt(0, 0, 0))
-        })?;
+    let naive = [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%d/%m/%Y %H:%M:%S%.f",
+    ]
+    .iter()
+    .find_map(|f| NaiveDateTime::parse_from_str(raw, f).ok())
+    .or_else(|| {
+        ["%Y-%m-%d", "%d/%m/%Y"]
+            .iter()
+            .find_map(|f| NaiveDate::parse_from_str(raw, f).ok())
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+    })?;
     ART.from_local_datetime(&naive)
         .earliest()
         .map(|t| t.with_timezone(&Utc))
@@ -262,6 +272,10 @@ mod tests {
             Some(500)
         );
         assert_eq!(parse_quote_time("2026-11-23"), utc(3, 0));
+        assert_eq!(parse_quote_time("2026-11-23 12:00:00"), utc(15, 0));
+        assert_eq!(parse_quote_time("23/11/2026 12:00:00"), utc(15, 0));
+        assert_eq!(parse_quote_time("23/11/2026"), utc(3, 0));
+        assert_eq!(parse_quote_time("2026-11-23T12:00:00-03:00"), utc(15, 0));
         assert_eq!(parse_quote_time("ayer"), None);
         assert_eq!(parse_quote_time(""), None);
     }

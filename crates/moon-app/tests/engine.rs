@@ -492,6 +492,7 @@ fn set_risk_state(h: &Harness, prev_price_usd: Decimal) {
         holdings: BTreeMap::from([("AAA".to_string(), dec!(100))]),
         prices_usd: BTreeMap::from([("AAA".to_string(), prev_price_usd)]),
         at: Some(clock_time()),
+        ..RiskIndex::default()
     };
     let (index_key, dd_key) = (
         h.engine.state_key(STATE_RISK_INDEX),
@@ -503,6 +504,9 @@ fn set_risk_state(h: &Harness, prev_price_usd: Decimal) {
         &dd_key,
         &DrawdownState {
             peak_nav: 1.0,
+            // These older tests exercise the emergency path itself: one prior breach means the
+            // next breaching check already confirms the trip.
+            breaches: 1,
             ..DrawdownState::default()
         },
     )
@@ -700,6 +704,7 @@ async fn paper_state_does_not_leak_into_live() {
             peak_nav: 50.0,
             tripped: true,
             tripped_on: Some(TODAY),
+            breaches: 0,
         };
         s.set_state("drawdown:paper", &paper_dd).expect("paper dd");
         s.set_state("drawdown", &paper_dd).expect("old global key");

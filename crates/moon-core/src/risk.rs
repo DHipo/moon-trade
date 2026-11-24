@@ -105,6 +105,13 @@ pub struct RiskLimits {
     pub cash_buffer: f64,
     #[serde(default)]
     pub max_equity_usd: Option<Decimal>,
+    /// Consecutive risk checks that must breach `max_drawdown` before the breaker trips.
+    #[serde(default = "default_trip_confirmations")]
+    pub trip_confirmations: u32,
+}
+
+fn default_trip_confirmations() -> u32 {
+    2
 }
 
 impl RiskLimits {
@@ -136,6 +143,9 @@ impl RiskLimits {
         }
         if self.max_equity_usd.is_some_and(|m| m <= Decimal::ZERO) {
             return bad("max_equity_usd debe ser > 0");
+        }
+        if !(1..=10).contains(&self.trip_confirmations) {
+            return bad("trip_confirmations debe estar entre 1 y 10");
         }
         Ok(())
     }
@@ -180,6 +190,9 @@ pub struct DrawdownState {
     pub peak_nav: f64,
     pub tripped: bool,
     pub tripped_on: Option<NaiveDate>,
+    /// Consecutive observations at or beyond the drawdown limit (see `observe_confirmed`).
+    #[serde(default)]
+    pub breaches: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +219,34 @@ impl DrawdownState {
         }
     }
 
+    /// Like `observe`, but a breach only trips after `confirmations` consecutive breaching
+    /// observations; a non-breaching observation resets the count.
+    pub fn observe_confirmed(
+        &mut self,
+        level: f64,
+        today: NaiveDate,
+        max_drawdown: f64,
+        confirmations: u32,
+    ) -> DrawdownSignal {
+        if self.tripped {
+            return DrawdownSignal::StillTripped;
+        }
+        if level > self.peak_nav {
+            self.peak_nav = level;
+        }
+        if self.drawdown(level) >= max_drawdown {
+            self.breaches = self.breaches.saturating_add(1);
+            if self.breaches >= confirmations {
+                self.tripped = true;
+                self.tripped_on = Some(today);
+                return DrawdownSignal::Tripped;
+            }
+        } else {
+            self.breaches = 0;
+        }
+        DrawdownSignal::Normal
+    }
+
     pub fn drawdown(&self, nav: f64) -> f64 {
         if self.peak_nav <= 0.0 {
             0.0
@@ -230,6 +271,7 @@ impl DrawdownState {
         self.peak_nav = nav;
         self.tripped = false;
         self.tripped_on = None;
+        self.breaches = 0;
     }
 }
 
@@ -333,6 +375,7 @@ mod tests {
             max_orders_per_day: 10,
             cash_buffer: 0.01,
             max_equity_usd: None,
+            trip_confirmations: 2,
         };
         assert!(ok.validate().is_ok());
         let cases = vec![
@@ -378,6 +421,14 @@ mod tests {
             },
             RiskLimits {
                 max_equity_usd: Some(dec!(0)),
+                ..ok.clone()
+            },
+            RiskLimits {
+                trip_confirmations: 0,
+                ..ok.clone()
+            },
+            RiskLimits {
+                trip_confirmations: 11,
                 ..ok.clone()
             },
             RiskLimits {
@@ -434,5 +485,52 @@ mod tests {
         assert!(!s.tripped);
         assert_eq!(s.peak_nav, 0.84);
         assert_eq!(s.tripped_on, None);
+    }
+
+    #[test]
+    fn confirmed_trip_needs_consecutive_breaches() {
+        let day = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
+        let mut s = DrawdownState {
+            peak_nav: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            s.observe_confirmed(0.8, day, 0.15, 2),
+            DrawdownSignal::Normal
+        );
+        assert_eq!(s.breaches, 1);
+        // A recovery resets the count.
+        assert_eq!(
+            s.observe_confirmed(0.95, day, 0.15, 2),
+            DrawdownSignal::Normal
+        );
+        assert_eq!(s.breaches, 0);
+        assert_eq!(
+            s.observe_confirmed(0.8, day, 0.15, 2),
+            DrawdownSignal::Normal
+        );
+        assert_eq!(
+            s.observe_confirmed(0.8, day, 0.15, 2),
+            DrawdownSignal::Tripped
+        );
+        assert_eq!(s.tripped_on, Some(day));
+        assert_eq!(
+            s.observe_confirmed(0.8, day, 0.15, 2),
+            DrawdownSignal::StillTripped
+        );
+        s.reset(0.8);
+        assert_eq!(s.breaches, 0);
+        // One confirmation behaves like `observe`.
+        assert_eq!(
+            s.observe_confirmed(0.6, day, 0.15, 1),
+            DrawdownSignal::Tripped
+        );
+    }
+
+    #[test]
+    fn old_drawdown_state_loads_with_defaults() {
+        let s: DrawdownState =
+            serde_json::from_str(r#"{"peak_nav":1.0,"tripped":false,"tripped_on":null}"#).unwrap();
+        assert_eq!(s.breaches, 0);
     }
 }

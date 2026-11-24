@@ -14,7 +14,7 @@ mod valuation;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail};
-use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Utc};
 use moon_broker::{Broker, QuoteSource};
 use moon_core::allocator::{AllocationDecision, Allocator};
 use moon_core::asset::{AssetId, Universe};
@@ -23,7 +23,7 @@ use moon_core::risk::DrawdownState;
 use moon_core::risk_index::RiskIndex;
 use moon_core::strategy::SignalContext;
 use moon_core::time::{ART, Clock, art_date};
-use moon_core::types::{ExecMode, OrderReason};
+use moon_core::types::{ExecMode, OrderReason, OrderStatus};
 use moon_store::{OrderRecord, Store, StoreError};
 use moon_yahoo::YahooClient;
 use rust_decimal::Decimal;
@@ -34,7 +34,8 @@ use crate::config::{AppConfig, TradingMode};
 use crate::notify::Notifier;
 
 pub use crate::scheduler::previous_trading_day;
-pub use reconcile::{Discrepancy, order_id_for, reconcile_positions};
+pub use jobs::monthly_batch_id;
+pub use reconcile::{Discrepancy, order_id_for, order_id_for_tranche, reconcile_positions};
 pub(crate) use text::status_es;
 
 // Global keys.
@@ -53,6 +54,10 @@ pub const STATE_DRAWDOWN: &str = "drawdown";
 pub const STATE_SCHEDULE: &str = "schedule";
 /// Last day (ART) up to which external flows were queried.
 pub const STATE_FLOWS_CHECKED: &str = "flows_checked_until";
+/// Month and attempt counter of the monthly rebalance (the attempt is part of the batch id).
+pub const STATE_MONTHLY_ATTEMPT: &str = "monthly_attempt";
+/// Deposits detected but not invested yet (their external ids).
+pub const STATE_DEPOSIT_PENDING: &str = "deposit_pending";
 /// Trip date for which the refuge buy after an emergency exit was already attempted.
 pub const STATE_EMERGENCY_REFUGE: &str = "emergency_refuge_done";
 /// Per asset, the last day the user was warned about an emergency order with unknown outcome.
@@ -122,6 +127,35 @@ pub enum MonthlyOutcome {
     Executed(ExecutionReport),
     ProposalSent(Uuid),
     NoChanges,
+    /// The monthly could not be carried out (stale signal data); it stays due.
+    Aborted(String),
+}
+
+impl MonthlyOutcome {
+    /// The month counts as done only if the plan was empty, a proposal was sent or at least one
+    /// order was accepted by the broker; otherwise the scheduler retries after a backoff.
+    pub fn is_complete(&self) -> bool {
+        match self {
+            Self::NoChanges | Self::ProposalSent(_) => true,
+            Self::Executed(r) => r
+                .orders
+                .iter()
+                .any(|o| !matches!(o.status, OrderStatus::Rejected | OrderStatus::Failed)),
+            Self::Aborted(_) => false,
+        }
+    }
+}
+
+/// Stored per mode: which month the attempt counter belongs to.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MonthlyAttempt {
+    pub month: String,
+    pub attempt: u32,
+}
+
+/// Last calendar day of the month before `today`'s month.
+pub fn last_day_of_previous_month(today: NaiveDate) -> NaiveDate {
+    today.with_day(1).unwrap_or(today) - Duration::days(1)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -301,10 +335,6 @@ impl Engine {
         tracker.nav(equity_usd).ok_or_else(|| {
             anyhow!("no se puede calcular el NAV: no hay unidades (patrimonio en cero)")
         })
-    }
-
-    pub(crate) fn holidays(&self) -> &[NaiveDate] {
-        &self.cfg.schedule.holidays
     }
 
     pub(crate) fn reason_label(reason: OrderReason) -> &'static str {

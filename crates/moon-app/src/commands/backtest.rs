@@ -4,7 +4,7 @@ use moon_store::{BacktestRun, Store};
 
 use super::data::load_series;
 use crate::config::AppConfig;
-use crate::report::format_metrics_table;
+use crate::report::{cash_refuge_warning, format_metrics_table};
 
 pub struct BacktestOutcome {
     pub result: BacktestResult,
@@ -69,6 +69,9 @@ pub fn run_backtest_command(
             "benchmark": &out.result.benchmark,
         });
         println!("{}", serde_json::to_string_pretty(&doc)?);
+        if let Some(w) = cash_refuge_warning(cfg) {
+            eprintln!("{w}");
+        }
         if include_holdout {
             eprintln!("{HOLDOUT_WARNING}");
         }
@@ -82,6 +85,9 @@ pub fn run_backtest_command(
         "Configuraciones distintas probadas: {}",
         out.distinct_configs
     );
+    if let Some(w) = cash_refuge_warning(cfg) {
+        println!("{w}");
+    }
     if include_holdout {
         println!("{HOLDOUT_WARNING}");
     }

@@ -779,13 +779,13 @@ async fn monthly_without_a_trip_leaves_the_peak_alone() {
 
 #[tokio::test]
 async fn failed_monthly_does_not_rearm_the_breaker() {
-    let h = Harness::live_with(TradingMode::LiveAuto, dec!(1200000), |cfg| {
-        cfg.risk.max_order_usd = dec!(100);
-    });
+    let h = Harness::live(TradingMode::LiveAuto, dec!(1200000));
     arm_breaker(&h);
     h.engine.run_risk_check().await.expect("trip");
-    // The monthly is blocked by the order limits: not executed, so the breaker stays latched.
-    let _ = h.engine.run_monthly(TODAY).await;
+    // Every order of the monthly is rejected: nothing was accepted, so the breaker stays latched.
+    h.fake().set_reject_place(true);
+    let out = h.engine.run_monthly(TODAY).await.expect("monthly");
+    assert!(!out.is_complete(), "{out:?}");
     let dd_key = h.engine.state_key(STATE_DRAWDOWN);
     let dd: DrawdownState = h
         .store
@@ -1022,20 +1022,48 @@ async fn limit_prices_follow_the_tick() {
 }
 
 #[tokio::test]
-async fn oversize_order_is_blocked_after_usd_to_ars_conversion() {
-    // 100 USD at CCL 1200 = 120,000 ARS per order; each buy is far larger.
+async fn oversize_order_is_split_into_tranches() {
+    // 100 USD at CCL 1200 = 120,000 ARS per order = 12 units at 10,000 ARS; each buy is larger.
     let h = Harness::live_with(TradingMode::LiveAuto, dec!(1200000), |cfg| {
         cfg.risk.max_order_usd = dec!(100);
     });
-    let err = h.engine.run_monthly(TODAY).await.expect_err("blocked");
-    assert!(err.to_string().contains("límites de riesgo"), "{err}");
-    assert!(h.fake().places().is_empty());
-    assert!(
-        h.notifier
-            .messages()
-            .iter()
-            .any(|m| m.contains("bloqueada"))
-    );
+    let out = h.engine.run_monthly(TODAY).await.expect("monthly");
+    let MonthlyOutcome::Executed(report) = out else {
+        panic!("expected Executed, got {out:?}");
+    };
+    let places = h.fake().places();
+    assert!(places.len() > 2, "each asset needs several tranches");
+    for t in &places {
+        let value = t.qty * t.limit_price.expect("limit");
+        // limit price is slightly above the 10,000 reference (tolerance), so allow that margin
+        assert!(t.qty <= dec!(12), "tranche of {} units", t.qty);
+        assert!(value <= dec!(125000), "{value}");
+    }
+    // distinct idempotency keys for every tranche
+    let mut keys: Vec<_> = places.iter().map(|t| t.idempotency_key).collect();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys.len(), places.len());
+    assert_eq!(report.orders.len(), places.len());
+}
+
+#[tokio::test]
+async fn tranches_count_toward_the_daily_order_limit() {
+    let h = Harness::live_with(TradingMode::LiveAuto, dec!(1200000), |cfg| {
+        cfg.risk.max_order_usd = dec!(100);
+        cfg.risk.max_orders_per_day = 3;
+    });
+    let out = h.engine.run_monthly(TODAY).await;
+    // Either the first phase or the recomputed buys hit the limit: nothing is sent.
+    let blocked = match &out {
+        Err(e) => e.to_string().contains("límites de riesgo"),
+        Ok(MonthlyOutcome::Executed(r)) => {
+            r.errors.iter().any(|e| e.contains("límites de riesgo")) || r.orders.is_empty()
+        }
+        Ok(_) => false,
+    };
+    assert!(blocked, "{out:?}");
+    assert!(h.fake().places().len() <= 3, "{}", h.fake().places().len());
 }
 
 // --- fix round 2 ---

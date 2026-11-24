@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use chrono::Utc;
+use chrono::{DateTime, TimeZone, Utc};
 use moon_app::commands::backtest::run_backtest_cmd;
 use moon_app::commands::data::{data_sync, load_series};
 use moon_app::config::AppConfig;
@@ -76,6 +76,11 @@ fn load_series_requires_data() {
     assert!(load_series(&cfg, &store).is_err());
 }
 
+/// 23:00 UTC of `day`: past 17:00 in New York.
+fn after_close(day: chrono::NaiveDate) -> DateTime<Utc> {
+    Utc.from_utc_datetime(&day.and_hms_opt(23, 0, 0).expect("time"))
+}
+
 const CHART: &str = r#"{"chart":{"result":[{"meta":{"gmtoffset":0},"timestamp":[1704205800,1704292200],
 "indicators":{"quote":[{"open":[1.0,2.0],"high":[1.0,2.0],"low":[1.0,2.0],"close":[1.0,2.0],"volume":[10,20]}],
 "adjclose":[{"adjclose":[1.0,2.0]}]}}],"error":null}}"#;
@@ -97,7 +102,7 @@ async fn data_sync_reports_partial_failure() {
         YahooClient::with_base_url(server.uri()).with_retry_delay(std::time::Duration::ZERO);
     let mut store = Store::open_in_memory().expect("store");
     let today = d(2024, 1, 10);
-    let report = data_sync(&cfg, &mut store, &yahoo, None, today)
+    let report = data_sync(&cfg, &mut store, &yahoo, None, today, after_close(today))
         .await
         .expect("sync");
     assert_eq!(report.failed.len(), 1);
@@ -110,4 +115,131 @@ async fn data_sync_reports_partial_failure() {
             .len(),
         2
     );
+}
+
+fn chart(timestamps: &[i64], adj: &[f64]) -> String {
+    let n = adj.len();
+    let list = |v: &[f64]| {
+        v.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        r#"{{"chart":{{"result":[{{"meta":{{"gmtoffset":0}},"timestamp":[{}],
+"indicators":{{"quote":[{{"open":[{o}],"high":[{o}],"low":[{o}],"close":[{o}],"volume":[{v}]}}],
+"adjclose":[{{"adjclose":[{}]}}]}}}}],"error":null}}}}"#,
+        timestamps
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        list(adj),
+        o = list(&vec![1.0; n]),
+        v = list(&vec![10.0; n]),
+    )
+}
+
+fn one_symbol_config() -> AppConfig {
+    let mut cfg = small_config();
+    cfg.assets = vec![spec("AAA", Role::Risky), spec("CASH", Role::Refuge)];
+    cfg.allocation.canary_threshold = None;
+    cfg.validate().expect("valid");
+    cfg
+}
+
+#[tokio::test]
+async fn sync_redownloads_full_history_when_the_overlap_was_restated() {
+    let cfg = one_symbol_config();
+    let server = MockServer::start().await;
+    // 2024-01-02 and 2024-01-03: the overlap comes back with a restated adj_close.
+    let ts = [1_704_205_800, 1_704_292_200];
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(chart(&ts, &[0.5, 1.0]), "application/json"),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // The full re-download carries one more (older) bar, so we can tell it was used.
+    let full_ts = [1_704_119_400, 1_704_205_800, 1_704_292_200];
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(chart(&full_ts, &[0.25, 0.5, 1.0]), "application/json"),
+        )
+        .mount(&server)
+        .await;
+    let yahoo =
+        YahooClient::with_base_url(server.uri()).with_retry_delay(std::time::Duration::ZERO);
+    let mut store = Store::open_in_memory().expect("store");
+    let old = daily_series(d(2024, 1, 2), &[1.0, 2.0]);
+    store
+        .upsert_bars("AAA", DataSource::Yahoo, old.bars())
+        .expect("seed");
+    let today = d(2024, 1, 10);
+    let report = data_sync(&cfg, &mut store, &yahoo, None, today, after_close(today))
+        .await
+        .expect("sync");
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    let bars = store.load_bars("AAA", DataSource::Yahoo).expect("bars");
+    assert_eq!(bars.len(), 3, "full history replaced the stored one");
+    assert!((bars[1].adj_close - 0.5).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn sync_keeps_the_overlap_window_when_nothing_was_restated() {
+    let cfg = one_symbol_config();
+    let server = MockServer::start().await;
+    let ts = [1_704_205_800, 1_704_292_200];
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(chart(&ts, &[1.0, 2.0]), "application/json"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let yahoo =
+        YahooClient::with_base_url(server.uri()).with_retry_delay(std::time::Duration::ZERO);
+    let mut store = Store::open_in_memory().expect("store");
+    let old = daily_series(d(2024, 1, 2), &[1.0, 2.0]);
+    store
+        .upsert_bars("AAA", DataSource::Yahoo, old.bars())
+        .expect("seed");
+    let today = d(2024, 1, 10);
+    data_sync(&cfg, &mut store, &yahoo, None, today, after_close(today))
+        .await
+        .expect("sync");
+    assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+}
+
+#[tokio::test]
+async fn sync_never_stores_the_bar_of_the_current_us_session() {
+    let cfg = one_symbol_config();
+    let server = MockServer::start().await;
+    // 2024-01-09 and 2024-01-10 (the current session).
+    let ts = [1_704_810_600, 1_704_897_000];
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(chart(&ts, &[5.0, 6.0]), "application/json"),
+        )
+        .mount(&server)
+        .await;
+    let yahoo =
+        YahooClient::with_base_url(server.uri()).with_retry_delay(std::time::Duration::ZERO);
+    let today = d(2024, 1, 10);
+    // 15:00 UTC = 10:00 in New York: the 2024-01-10 session is still open.
+    let during = Utc.from_utc_datetime(&today.and_hms_opt(15, 0, 0).expect("time"));
+    let mut store = Store::open_in_memory().expect("store");
+    data_sync(&cfg, &mut store, &yahoo, None, today, during)
+        .await
+        .expect("sync");
+    let bars = store.load_bars("AAA", DataSource::Yahoo).expect("bars");
+    assert_eq!(bars.last().map(|b| b.date), Some(d(2024, 1, 9)));
+    // After the close the same bar is accepted.
+    data_sync(&cfg, &mut store, &yahoo, None, today, after_close(today))
+        .await
+        .expect("sync");
+    let bars = store.load_bars("AAA", DataSource::Yahoo).expect("bars");
+    assert_eq!(bars.last().map(|b| b.date), Some(d(2024, 1, 10)));
 }

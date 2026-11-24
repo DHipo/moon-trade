@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{BrokerError, QuoteSource};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FxPair {
     pub local_symbol: String,
     pub adr_symbol: String,

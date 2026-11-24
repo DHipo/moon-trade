@@ -140,6 +140,9 @@ monthly_contribution = 0
 slippage_rate = 0.003
 holdout_start = "2023-01-01" # período virgen: no mirarlo hasta la validación final
 risk_free_rate = 0.0
+# Retorno anual en USD del efectivo (refugio CASH). En vivo el efectivo son pesos: ponelo negativo
+# (ej. -0.10) para no sobrestimar el refugio. Con 0.0 el CASH se simula sin pérdida.
+cash_usd_return = 0.0
 
 [backtest.fees]              # comisiones del backtest (montos en USD)
 commission_rate = 0.006

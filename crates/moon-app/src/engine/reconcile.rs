@@ -53,6 +53,17 @@ pub fn order_id_for(batch_id: Uuid, asset: &AssetId, side: Side) -> Uuid {
     Uuid::new_v5(&batch_id, format!("{asset}:{}", side.as_str()).as_bytes())
 }
 
+/// Idempotency key of the `tranche`-th piece of a split order; tranche 0 is [`order_id_for`].
+pub fn order_id_for_tranche(batch_id: Uuid, asset: &AssetId, side: Side, tranche: u32) -> Uuid {
+    if tranche == 0 {
+        return order_id_for(batch_id, asset, side);
+    }
+    Uuid::new_v5(
+        &batch_id,
+        format!("{asset}:{}:{tranche}", side.as_str()).as_bytes(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

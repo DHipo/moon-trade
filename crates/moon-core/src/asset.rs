@@ -64,6 +64,7 @@ fn default_ratio() -> f64 {
 
 /// How an asset is executed at the broker.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecSpec {
     pub symbol: String,
     pub market: Market,
@@ -74,6 +75,7 @@ pub struct ExecSpec {
 
 /// One asset of the universe.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssetSpec {
     pub id: AssetId,
     pub role: Role,

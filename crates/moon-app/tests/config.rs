@@ -33,6 +33,7 @@ fn live_requires_double_opt_in() {
 
     cfg.live.enabled = true;
     cfg.validate().expect("opted in");
+    cfg.telegram.enabled = true;
     let none = Secrets {
         iol_username: None,
         iol_password: None,
@@ -43,11 +44,99 @@ fn live_requires_double_opt_in() {
     let ok = Secrets {
         iol_username: Some("u".into()),
         iol_password: Some("p".into()),
-        ..none
+        telegram_token: Some("t".into()),
+        telegram_chat_id: Some(1),
     };
     validate_live(&cfg, &ok).expect("secrets present");
     // paper never needs secrets
-    assert!(validate_live(&example(), &ok).is_ok());
+    assert!(validate_live(&example(), &none).is_ok());
+}
+
+fn live_ready() -> (AppConfig, Secrets) {
+    let mut cfg = example();
+    cfg.mode = TradingMode::LiveConfirm;
+    cfg.live.enabled = true;
+    cfg.telegram.enabled = true;
+    let secrets = Secrets {
+        iol_username: Some("u".into()),
+        iol_password: Some("p".into()),
+        telegram_token: Some("t".into()),
+        telegram_chat_id: Some(1),
+    };
+    (cfg, secrets)
+}
+
+#[test]
+fn live_requires_iol_quotes() {
+    let (mut cfg, secrets) = live_ready();
+    validate_live(&cfg, &secrets).expect("ready");
+    cfg.execution.quote_source = moon_app::config::QuoteSourceKind::Yahoo;
+    let err = validate_live(&cfg, &secrets)
+        .expect_err("yahoo quotes")
+        .to_string();
+    assert!(err.contains("quote_source"), "{err}");
+}
+
+#[test]
+fn live_requires_telegram() {
+    let (mut cfg, mut secrets) = live_ready();
+    secrets.telegram_chat_id = None;
+    let err = validate_live(&cfg, &secrets)
+        .expect_err("no chat id")
+        .to_string();
+    assert!(err.contains("TELEGRAM"), "{err}");
+    secrets.telegram_chat_id = Some(1);
+    secrets.telegram_token = None;
+    assert!(validate_live(&cfg, &secrets).is_err());
+    secrets.telegram_token = Some("t".into());
+    cfg.telegram.enabled = false;
+    let err = validate_live(&cfg, &secrets)
+        .expect_err("disabled")
+        .to_string();
+    assert!(err.contains("[telegram]"), "{err}");
+}
+
+fn example_text() -> String {
+    std::fs::read_to_string("../../moon.example.toml").expect("example")
+}
+
+fn load_text(text: &str) -> anyhow::Result<AppConfig> {
+    let dir = tempfile::tempdir().expect("tmp");
+    let path = dir.path().join("moon.toml");
+    std::fs::write(&path, text).expect("write");
+    AppConfig::load(&path)
+}
+
+#[test]
+fn unknown_config_keys_are_rejected_everywhere() {
+    let base = example_text();
+    // top level, a section, a nested struct and a flattened-before section (backtest)
+    let cases = [
+        ("mode = \"paper\"", "mode = \"paper\"\nmodo_tipeado = 1"),
+        ("[risk]", "[risk]\nmax_drawdwn = 0.1"),
+        ("[execution]", "[execution]\nlimit_tolerence = 0.1"),
+        ("[backtest]", "[backtest]\ncash_usd_retun = -0.1"),
+        ("[backtest.fees]", "[backtest.fees]\ncommision_rate = 0.1"),
+        ("[telegram]", "[telegram]\nenabeld = true"),
+        ("kind = \"faber_sma\"", "kind = \"faber_sma\"\nmonts = 3"),
+    ];
+    for (needle, replacement) in cases {
+        assert!(base.contains(needle), "{needle}");
+        let text = base.replacen(needle, replacement, 1);
+        let err = load_text(&text).expect_err(needle);
+        assert!(
+            format!("{err:#}").contains("unknown field"),
+            "{needle}: {err:#}"
+        );
+    }
+    load_text(&base).expect("the example itself stays valid");
+}
+
+#[test]
+fn backtest_cash_return_is_configurable() {
+    let text = example_text().replacen("cash_usd_return = 0.0", "cash_usd_return = -0.2", 1);
+    let cfg = load_text(&text).expect("loads");
+    assert!((cfg.backtest.config.cash_usd_return + 0.2).abs() < 1e-12);
 }
 
 #[test]
@@ -100,7 +189,13 @@ fn metrics_table_is_spanish() {
         .collect();
     let m = nav_metrics(&navs, 0.0);
     let t = format_metrics_table(&m, Some(&m));
-    for s in ["CAGR", "Máxima caída", "Sharpe"] {
+    for s in [
+        "CAGR",
+        "Máxima caída",
+        "Sharpe",
+        "Aportes netos (USD)",
+        "Rotación anual",
+    ] {
         assert!(t.contains(s), "{t}");
     }
 }
@@ -116,4 +211,14 @@ fn emergency_limit_discount_defaults_and_is_validated() {
     assert!(err.contains("emergency_limit_discount"), "{err}");
     cfg.execution.emergency_limit_discount = dec!(-0.01);
     assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn cash_refuge_warning_depends_on_the_cash_return() {
+    let mut cfg = example();
+    let w = moon_app::report::cash_refuge_warning(&cfg).expect("CASH refuge at 0 %");
+    assert!(w.contains("backtest.cash_usd_return"), "{w}");
+    assert!(w.contains("sin pérdida"), "{w}");
+    cfg.backtest.config.cash_usd_return = -0.1;
+    assert!(moon_app::report::cash_refuge_warning(&cfg).is_none());
 }

@@ -32,6 +32,7 @@ pub enum QuoteSourceKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionConfig {
     pub slippage_rate: Decimal,
     pub limit_tolerance: Decimal,
@@ -52,12 +53,14 @@ fn default_emergency_limit_discount() -> Decimal {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FxConfig {
     pub pairs: Vec<FxPair>,
     pub min_pairs: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScheduleConfig {
     pub market_open: NaiveTime,
     pub market_close: NaiveTime,
@@ -72,32 +75,37 @@ pub struct ScheduleConfig {
 
 /// Backtest settings; amounts (capital, fees) are in USD.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct BacktestSettings {
-    #[serde(flatten)]
     pub config: BacktestConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PaperConfig {
     pub initial_cash_ars: Decimal,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LiveConfig {
     pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IolConfig {
     pub base_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TelegramConfig {
     pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub mode: TradingMode,
     pub database_path: PathBuf,
@@ -261,6 +269,21 @@ pub fn validate_live(cfg: &AppConfig, secrets: &Secrets) -> anyhow::Result<()> {
     if secrets.iol_username.is_none() || secrets.iol_password.is_none() {
         bail!(
             "El modo live requiere MOON_IOL_USERNAME y MOON_IOL_PASSWORD en el entorno o en .env."
+        );
+    }
+    if cfg.execution.quote_source != QuoteSourceKind::Iol {
+        bail!(
+            "El modo live requiere execution.quote_source = \"iol\": las cotizaciones de Yahoo no sirven para operar en real."
+        );
+    }
+    if !cfg.telegram.enabled {
+        bail!(
+            "El modo live requiere [telegram] enabled = true: sin Telegram no habría avisos ni aprobaciones."
+        );
+    }
+    if secrets.telegram_token.is_none() || secrets.telegram_chat_id.is_none() {
+        bail!(
+            "El modo live requiere MOON_TELEGRAM_TOKEN y MOON_TELEGRAM_CHAT_ID en el entorno o en .env."
         );
     }
     Ok(())

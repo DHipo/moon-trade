@@ -2,8 +2,11 @@
 
 use std::time::{Duration, Instant};
 
+use std::collections::BTreeSet;
+
 use anyhow::{anyhow, bail};
 use moon_broker::{OrderProgress, OrderTicket};
+use moon_core::asset::AssetId;
 use moon_core::money::{floor_to_lot, round_money, round_price};
 use moon_core::rebalance::{PlannedOrder, RebalancePlan};
 use moon_core::risk::check_orders;
@@ -14,7 +17,7 @@ use moon_store::OrderRecord;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-use super::reconcile::order_id_for;
+use super::reconcile::order_id_for_tranche;
 use super::text::execution_summary;
 use super::{Engine, ExecutionReport, ORDER_BLOCKED, UNKNOWN_OUTCOME, art_day_bounds};
 
@@ -53,6 +56,22 @@ impl Engine {
         batch_id: Uuid,
         emergency: bool,
     ) -> anyhow::Result<ExecutionReport> {
+        self.execute_excluding(plan, targets, reason, batch_id, emergency, &BTreeSet::new())
+            .await
+    }
+
+    /// Like [`Engine::execute`], never trading the `excluded` assets (they already have a working
+    /// order or an order with unknown outcome): neither the plan's orders nor the buys that are
+    /// recomputed from real cash include them.
+    pub(crate) async fn execute_excluding(
+        &self,
+        plan: &RebalancePlan,
+        targets: &TargetWeights,
+        reason: OrderReason,
+        batch_id: Uuid,
+        emergency: bool,
+        excluded: &BTreeSet<AssetId>,
+    ) -> anyhow::Result<ExecutionReport> {
         // Emergency exits never depend on the CCL (their order checks ignore the size limit).
         let ccl = self
             .db(|s| s.latest_fx())?
@@ -70,13 +89,25 @@ impl Engine {
         let first_phase: Vec<PlannedOrder> = if emergency {
             plan.sells().into_iter().cloned().collect()
         } else {
-            plan.orders.clone()
+            plan.orders
+                .iter()
+                .filter(|o| !excluded.contains(&o.asset))
+                .cloned()
+                .collect()
         };
         let mut errors: Vec<String> = Vec::new();
         let first_phase = self.cap_sells(first_phase, &mut errors).await?;
+        // An order above `max_order_usd` is split into tranches instead of blocking the plan
+        // (emergency exits ignore the size limit).
+        let first_phase = if emergency {
+            first_phase.into_iter().map(|o| (o, 0)).collect()
+        } else {
+            self.split_oversize(first_phase, ccl)
+        };
         let already = self.orders_today_outside(batch_id)?;
+        let checked: Vec<PlannedOrder> = first_phase.iter().map(|(o, _)| o.clone()).collect();
         if let Err(violation) = check_orders(
-            &first_phase,
+            &checked,
             round_money(self.cfg.risk.max_order_usd * ccl),
             self.cfg.risk.max_orders_per_day,
             already,
@@ -91,12 +122,14 @@ impl Engine {
         let mut halted = false;
 
         // Phase 1: sells.
-        let sells: Vec<&PlannedOrder> = first_phase
+        let sells: Vec<&(PlannedOrder, u32)> = first_phase
             .iter()
-            .filter(|o| o.side == Side::Sell)
+            .filter(|(o, _)| o.side == Side::Sell)
             .collect();
-        for order in &sells {
-            let out = self.send_order(order, reason, batch_id, emergency).await?;
+        for (order, tranche) in sells {
+            let out = self
+                .send_order(order, *tranche, reason, batch_id, emergency)
+                .await?;
             ids.push(out.id);
             if let Some(msg) = out.halt {
                 errors.push(msg);
@@ -110,10 +143,10 @@ impl Engine {
 
         // Phase 2: buys recomputed from the broker's real cash.
         if !halted && !emergency {
-            match self.recompute_buys(targets, batch_id).await {
+            match self.recompute_buys(targets, batch_id, excluded).await {
                 Ok((buys, cash)) => {
                     let mut cash_left = cash;
-                    for order in &buys {
+                    for (order, tranche) in &buys {
                         let cost = self.buy_cost(order);
                         if cost > cash_left {
                             errors.push(format!(
@@ -122,7 +155,9 @@ impl Engine {
                             ));
                             continue;
                         }
-                        let out = self.send_order(order, reason, batch_id, emergency).await?;
+                        let out = self
+                            .send_order(order, *tranche, reason, batch_id, emergency)
+                            .await?;
                         ids.push(out.id);
                         if let Some(msg) = out.halt {
                             errors.push(msg);
@@ -222,24 +257,76 @@ impl Engine {
         Ok(out)
     }
 
-    /// Fresh valuation and plan; returns only the buys, plus the real cash they can use.
+    /// Fresh valuation and plan; returns only the buys (split into tranches, never the
+    /// `excluded` assets), plus the real cash they can use.
     async fn recompute_buys(
         &self,
         targets: &TargetWeights,
         batch_id: Uuid,
-    ) -> anyhow::Result<(Vec<PlannedOrder>, Decimal)> {
+        excluded: &BTreeSet<AssetId>,
+    ) -> anyhow::Result<(Vec<(PlannedOrder, u32)>, Decimal)> {
         let v = self.valuation().await?;
         let plan = self.plan(targets, &v, false)?;
-        let buys: Vec<PlannedOrder> = plan.buys().into_iter().cloned().collect();
+        let buys: Vec<PlannedOrder> = plan
+            .buys()
+            .into_iter()
+            .filter(|o| !excluded.contains(&o.asset))
+            .cloned()
+            .collect();
+        let buys = self.split_oversize(buys, v.ccl);
         let already = self.orders_today_outside(batch_id)?;
+        let checked: Vec<PlannedOrder> = buys.iter().map(|(o, _)| o.clone()).collect();
         check_orders(
-            &buys,
+            &checked,
             round_money(self.cfg.risk.max_order_usd * v.ccl),
             self.cfg.risk.max_orders_per_day,
             already,
             false,
         )?;
         Ok((buys, v.cash_ars))
+    }
+
+    /// Splits every order whose estimated value exceeds `max_order_usd` (at `ccl`) into tranches
+    /// of at most that value, each a whole number of lots. Returns the orders with their tranche
+    /// index (0 for an order that was not split). A single lot above the limit is left alone and
+    /// the order check blocks it.
+    fn split_oversize(&self, orders: Vec<PlannedOrder>, ccl: Decimal) -> Vec<(PlannedOrder, u32)> {
+        let max_value = round_money(self.cfg.risk.max_order_usd * ccl);
+        let mut out = Vec::with_capacity(orders.len());
+        for order in orders {
+            if order.est_value <= max_value || order.exec_price <= Decimal::ZERO {
+                out.push((order, 0));
+                continue;
+            }
+            let lot = self
+                .universe
+                .get(&order.asset)
+                .and_then(|a| a.exec.as_ref())
+                .map_or(1, |e| e.lot_size);
+            let per_tranche = floor_to_lot(max_value / order.exec_price, lot);
+            if per_tranche <= Decimal::ZERO {
+                out.push((order, 0));
+                continue;
+            }
+            let mut left = order.qty;
+            let mut index = 0_u32;
+            while left > Decimal::ZERO {
+                let qty = per_tranche.min(left);
+                let value = round_money(qty * order.exec_price);
+                out.push((
+                    PlannedOrder {
+                        qty,
+                        est_value: value,
+                        est_fees: self.cfg.fees.total(value),
+                        ..order.clone()
+                    },
+                    index,
+                ));
+                index += 1;
+                left -= qty;
+            }
+        }
+        out
     }
 
     /// Orders created today (ART) in this mode that do not belong to `batch_id`.
@@ -256,6 +343,7 @@ impl Engine {
     async fn send_order(
         &self,
         order: &PlannedOrder,
+        tranche: u32,
         reason: OrderReason,
         batch_id: Uuid,
         emergency: bool,
@@ -265,7 +353,7 @@ impl Engine {
             .get(&order.asset)
             .and_then(|a| a.exec.clone())
             .ok_or_else(|| anyhow!("{} no es operable", order.asset))?;
-        let id = order_id_for(batch_id, &order.asset, order.side);
+        let id = order_id_for_tranche(batch_id, &order.asset, order.side, tranche);
         let now = self.now();
         // Emergency sells: an aggressive limit (below the last price by the configured discount)
         // when a fresh quote is known, otherwise at market; the priority is getting out.

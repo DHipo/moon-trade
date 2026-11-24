@@ -94,6 +94,7 @@ pub fn check_targets(
 
 /// Configurable hard limits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RiskLimits {
     pub max_weight: f64,
     pub max_drawdown: f64,

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use moon_core::time::art_date;
-use moon_telegram::TelegramClient;
+use moon_telegram::{IncomingKind, TelegramClient};
 
 use crate::config::TradingMode;
 use crate::engine::{Engine, STATE_SCHEDULE, STATE_TELEGRAM_OFFSET};
@@ -36,7 +36,46 @@ fn job_label(job: Job) -> &'static str {
     }
 }
 
+/// Warnings to show right after the service starts.
+pub fn startup_warnings(engine: &Engine) -> Vec<String> {
+    let mut out = Vec::new();
+    if engine.config().schedule.holidays.is_empty() {
+        out.push(
+            "⚠️ schedule.holidays está vacío: el bot no conoce los feriados de BYMA y puede intentar operar en días sin mercado. Cargalos en moon.toml."
+                .to_string(),
+        );
+    }
+    out
+}
+
 pub async fn serve(engine: Arc<Engine>, telegram: Option<TelegramClient>) -> anyhow::Result<()> {
+    let telegram_task = telegram.map(|client| {
+        let engine = engine.clone();
+        tokio::spawn(async move { telegram_loop(engine, client).await })
+    });
+    run_service(
+        engine,
+        telegram_task,
+        TICK,
+        Duration::ZERO,
+        tokio::signal::ctrl_c(),
+    )
+    .await
+}
+
+/// The scheduler loop. `telegram_task` is watched: if it ends or panics the service reports it
+/// (best effort) and returns an error, so the OS service manager restarts the process.
+/// `first_tick_delay` is how long to wait before the first scheduler tick.
+pub async fn run_service<S>(
+    engine: Arc<Engine>,
+    mut telegram_task: Option<tokio::task::JoinHandle<()>>,
+    tick: Duration,
+    first_tick_delay: Duration,
+    shutdown: S,
+) -> anyhow::Result<()>
+where
+    S: std::future::Future,
+{
     let notifier = engine.deps().notifier.clone();
     notifier
         .notify(&format!(
@@ -44,26 +83,47 @@ pub async fn serve(engine: Arc<Engine>, telegram: Option<TelegramClient>) -> any
             mode_label(engine.config().mode)
         ))
         .await;
-
-    let telegram_task = telegram.map(|client| {
-        let engine = engine.clone();
-        tokio::spawn(async move { telegram_loop(engine, client).await })
-    });
+    for warning in startup_warnings(&engine) {
+        notifier.notify(&warning).await;
+    }
 
     let mut recent_errors: BTreeMap<String, DateTime<Utc>> = BTreeMap::new();
-    let mut ticker = tokio::time::interval(TICK);
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + first_tick_delay, tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
+    tokio::pin!(shutdown);
+    let outcome = loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
+            biased;
+            ended = async {
+                match telegram_task.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let detail = match ended {
+                    Ok(()) => "terminó inesperadamente".to_string(),
+                    Err(e) if e.is_panic() => "falló (panic)".to_string(),
+                    Err(e) => format!("se canceló ({e})"),
+                };
+                notifier
+                    .notify(&format!(
+                        "🔴 El servicio de Telegram {detail}: moon-trade se detiene para que el sistema lo reinicie."
+                    ))
+                    .await;
+                telegram_task = None;
+                break Err(anyhow::anyhow!("la tarea de Telegram {detail}"));
+            }
+            _ = &mut shutdown => break Ok(()),
             _ = ticker.tick() => run_tick(&engine, &mut recent_errors).await,
         }
-    }
+    };
     if let Some(task) = telegram_task {
         task.abort();
     }
-    notifier.notify("🔴 moon-trade detenido").await;
-    Ok(())
+    if outcome.is_ok() {
+        notifier.notify("🔴 moon-trade detenido").await;
+    }
+    outcome
 }
 
 fn load_state(engine: &Engine) -> ScheduleState {
@@ -101,8 +161,12 @@ async fn run_tick(engine: &Engine, recent_errors: &mut BTreeMap<String, DateTime
         if let Err(e) = &result {
             notify_error(engine, recent_errors, job_label(job), &format!("{e:#}")).await;
         }
-        // Monthly is done on any Ok outcome; daily close and weekly report even on error.
-        let finished = result.is_ok() || matches!(job, Job::DailyClose | Job::WeeklyReport);
+        // Monthly is done only when complete (see `MonthlyOutcome::is_complete`); daily close and
+        // weekly report even on error. A risk check never "finishes".
+        let finished = match &result {
+            Ok(done) => *done,
+            Err(_) => matches!(job, Job::DailyClose | Job::WeeklyReport),
+        };
         if finished {
             mark_done(&mut state, job, at);
         }
@@ -110,16 +174,27 @@ async fn run_tick(engine: &Engine, recent_errors: &mut BTreeMap<String, DateTime
     }
 }
 
-async fn run_job(engine: &Engine, job: Job) -> anyhow::Result<()> {
+/// Runs one job; `Ok(true)` means it is finished for its period.
+async fn run_job(engine: &Engine, job: Job) -> anyhow::Result<bool> {
     let today = art_date(Utc::now());
     match job {
-        Job::MonthlyRebalance => engine.run_monthly(today).await.map(|_| ()),
-        Job::RiskCheck => engine.run_risk_check().await.map(|_| ()),
-        Job::DailyClose => engine.run_daily_close(today).await,
+        Job::MonthlyRebalance => engine
+            .run_monthly(today)
+            .await
+            .map(|outcome| outcome.is_complete()),
+        Job::RiskCheck => {
+            let result = engine.run_risk_check().await.map(|_| true);
+            // Deposit detection is a separate best-effort step: it never blocks the risk check.
+            if let Err(e) = engine.check_deposits().await {
+                tracing::warn!("no se pudieron revisar los depósitos: {e:#}");
+            }
+            result
+        }
+        Job::DailyClose => engine.run_daily_close(today).await.map(|()| true),
         Job::WeeklyReport => {
             let text = engine.weekly_report().await?;
             engine.deps().notifier.notify(&text).await;
-            Ok(())
+            Ok(true)
         }
     }
 }
@@ -151,13 +226,23 @@ async fn telegram_loop(engine: Arc<Engine>, client: TelegramClient) {
         match client.poll(offset, POLL_TIMEOUT_SECS).await {
             Ok(updates) => {
                 for update in updates {
-                    let action = handle_incoming(&engine, &update).await;
-                    // Persist before replying: a processed update is never handled twice.
+                    // Persist before handling: a processed update is never handled twice.
                     let next = update.update_id.saturating_add(1);
                     if let Err(e) = engine.db(|s| s.set_state(STATE_TELEGRAM_OFFSET, &next)) {
                         tracing::error!("no se pudo guardar el offset de Telegram: {e}");
                     }
-                    apply_action(&client, action).await;
+                    if matches!(update.kind, IncomingKind::Callback { .. }) {
+                        // An approval can wait for the trading lock for minutes: handle it in its
+                        // own task so commands (/estado, /pausa) keep being answered.
+                        let (engine, client) = (engine.clone(), client.clone());
+                        tokio::spawn(async move {
+                            let action = handle_incoming(&engine, &update).await;
+                            apply_action(&client, action).await;
+                        });
+                    } else {
+                        let action = handle_incoming(&engine, &update).await;
+                        apply_action(&client, action).await;
+                    }
                 }
             }
             Err(e) => {

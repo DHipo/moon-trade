@@ -1,6 +1,7 @@
 //! Spanish texts for notifications, status and the weekly report.
 
 use chrono::Duration;
+use moon_core::money::round_money;
 use moon_core::nav::NavTracker;
 use moon_core::rebalance::RebalancePlan;
 use moon_core::risk::DrawdownState;
@@ -8,6 +9,7 @@ use moon_core::risk_index::RiskIndex;
 use moon_core::time::art_date;
 use moon_core::types::{OrderReason, OrderStatus, Side};
 use moon_core::weights::TargetWeights;
+use moon_store::{FlowKind, ProposalKind};
 use rust_decimal::Decimal;
 
 use super::{
@@ -107,15 +109,19 @@ pub(crate) fn execution_summary(reason: OrderReason, report: &ExecutionReport) -
 
 /// Text of a monthly proposal awaiting approval.
 pub(crate) fn proposal_text(
+    kind: ProposalKind,
     as_of: chrono::NaiveDate,
     targets: &TargetWeights,
     plan: &RebalancePlan,
     expires_at_art: &str,
 ) -> String {
-    let mut lines = vec![
-        format!("📋 Propuesta de rebalanceo mensual (señales al {as_of})"),
-        "Pesos objetivo:".to_string(),
-    ];
+    let title = match kind {
+        ProposalKind::Monthly => format!("📋 Propuesta de rebalanceo mensual (señales al {as_of})"),
+        ProposalKind::Deposit => {
+            format!("📋 Propuesta de compras por un depósito detectado ({as_of}, solo compras)")
+        }
+    };
+    let mut lines = vec![title, "Pesos objetivo:".to_string()];
     for (id, w) in targets.iter() {
         lines.push(format!("• {id}: {}", pct(w)));
     }
@@ -131,6 +137,10 @@ pub(crate) fn proposal_text(
             ars(o.est_fees)
         ));
     }
+    lines.push(
+        "El plan se recalcula con los precios y el efectivo del momento en que aprobás: puede diferir de lo mostrado."
+            .to_string(),
+    );
     lines.push(format!("Vence: {expires_at_art} (hora Argentina)."));
     lines.join("\n")
 }
@@ -238,16 +248,55 @@ impl Engine {
             .filter(|o| o.filled_qty > Decimal::ZERO)
             .collect();
         let fees: Decimal = filled.iter().map(|o| o.fees).sum();
+        let fees_label = if filled.iter().any(|o| o.fees_estimated) {
+            "comisiones (estimadas)"
+        } else {
+            "comisiones"
+        };
+
+        // Deposits and withdrawals of the week and the equity bridge (USD at today's CCL).
+        let flows: Vec<_> = self
+            .db(|s| s.flows_between(mode, week_ago, now))?
+            .into_iter()
+            .filter(|f| f.at > week_ago)
+            .collect();
+        let deposits: Decimal = flows
+            .iter()
+            .filter(|f| f.kind == FlowKind::Deposit)
+            .map(|f| f.amount_ars.abs())
+            .sum();
+        let withdrawals: Decimal = flows
+            .iter()
+            .filter(|f| f.kind == FlowKind::Withdrawal)
+            .map(|f| f.amount_ars.abs())
+            .sum();
+        let net_usd = round_money((deposits - withdrawals) / v.ccl);
+        let bridge = match snapshots.first() {
+            Some(first) => {
+                let result = v.equity_usd - first.equity_usd - net_usd;
+                format!(
+                    "Puente del patrimonio (USD): inicial {} → aportes netos {:+} → resultado {:+} → final {}",
+                    first.equity_usd, net_usd, result, v.equity_usd
+                )
+            }
+            None => "Puente del patrimonio: sin snapshot inicial de la semana".to_string(),
+        };
 
         let mut lines = vec![
             String::new(),
             "🗓️ Resumen semanal".to_string(),
             format!("Variación del NAV en 7 días: {change}"),
             format!(
-                "Operaciones de la semana: {} · comisiones: {}",
+                "Operaciones de la semana: {} · {fees_label}: {}",
                 filled.len(),
                 ars(fees)
             ),
+            format!(
+                "Depósitos de la semana: {} · extracciones: {}",
+                ars(deposits),
+                ars(withdrawals)
+            ),
+            bridge,
         ];
         for o in filled {
             let price = o

@@ -2,6 +2,8 @@
 
 use moon_core::metrics::Metrics;
 
+use crate::config::AppConfig;
+
 fn pct(x: f64) -> String {
     format!("{:.2}%", x * 100.0)
 }
@@ -44,13 +46,26 @@ pub fn format_metrics_table(strategy: &Metrics, benchmark: Option<&Metrics>) -> 
         out.push('\n');
     }
     out.push_str(&format!(
-        "{:<20}{:>14}\n{:<20}{:>14}\n{:<20}{:>14}\n",
+        "{:<20}{:>14}\n{:<20}{:>14}\n{:<20}{:>14}\n{:<20}{:>14}\n{:<20}{:>14}\n",
         "Operaciones",
         strategy.trades,
+        "Rotación anual",
+        pct(strategy.turnover),
         "Comisiones (USD)",
         strategy.total_fees,
+        "Aportes netos (USD)",
+        strategy.net_contributions,
         "Capital final (USD)",
         strategy.final_equity
     ));
     out
+}
+
+/// Warning shown with a backtest whose refuge is CASH simulated without any loss in dollars.
+pub fn cash_refuge_warning(cfg: &AppConfig) -> Option<String> {
+    let refuge_is_cash = cfg.universe().ok().is_some_and(|u| u.refuge().id.is_cash());
+    (refuge_is_cash && cfg.backtest.config.cash_usd_return == 0.0).then(|| {
+        "⚠️ El refugio CASH se simula en dólares sin pérdida; en vivo son pesos (configurá backtest.cash_usd_return)"
+            .to_string()
+    })
 }

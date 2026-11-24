@@ -25,6 +25,7 @@ use crate::types::{OrderReason, Side};
 use crate::weights::TargetWeights;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BacktestConfig {
     pub start: NaiveDate,
     #[serde(default)]

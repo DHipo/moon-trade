@@ -184,6 +184,10 @@ impl FakeBroker {
             .insert(symbol.to_string(), qty);
     }
 
+    pub fn account_snapshot(&self) -> AccountState {
+        self.account.lock().expect("lock").clone()
+    }
+
     pub fn places(&self) -> Vec<OrderTicket> {
         self.places.lock().expect("lock").clone()
     }

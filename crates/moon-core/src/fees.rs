@@ -8,6 +8,7 @@ use crate::money::round_money;
 
 /// Fee rates as fractions (0.006 = 0.6 %).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FeeModel {
     pub commission_rate: Decimal,
     pub market_fee_rate: Decimal,

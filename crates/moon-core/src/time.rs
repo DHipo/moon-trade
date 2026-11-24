@@ -5,6 +5,9 @@ use chrono::{DateTime, NaiveDate, Utc};
 /// Time zone used for scheduling and for dates derived from IOL timestamps.
 pub const ART: chrono_tz::Tz = chrono_tz::America::Argentina::Buenos_Aires;
 
+/// Time zone of the US markets (signal data is dated in it).
+pub const NEW_YORK: chrono_tz::Tz = chrono_tz::America::New_York;
+
 pub trait Clock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }

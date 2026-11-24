@@ -62,6 +62,7 @@ impl Notifier for LogNotifier {
 pub struct RecordingNotifier {
     messages: Mutex<Vec<String>>,
     approvals: Mutex<Vec<Uuid>>,
+    approval_texts: Mutex<Vec<String>>,
 }
 
 impl RecordingNotifier {
@@ -71,6 +72,14 @@ impl RecordingNotifier {
 
     pub fn messages(&self) -> Vec<String> {
         self.messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Texts of the approval requests, in order.
+    pub fn approval_texts(&self) -> Vec<String> {
+        self.approval_texts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -93,11 +102,11 @@ impl Notifier for RecordingNotifier {
             .push(text.to_string());
     }
 
-    async fn request_approval(
-        &self,
-        proposal_id: Uuid,
-        _text: &str,
-    ) -> anyhow::Result<Option<i64>> {
+    async fn request_approval(&self, proposal_id: Uuid, text: &str) -> anyhow::Result<Option<i64>> {
+        self.approval_texts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(text.to_string());
         let mut a = self.approvals.lock().unwrap_or_else(|e| e.into_inner());
         a.push(proposal_id);
         Ok(Some(i64::try_from(a.len()).unwrap_or(i64::MAX)))

@@ -21,7 +21,7 @@ pub enum SizingKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StrategyConfig {
     FaberSma {
         months: usize,
@@ -37,6 +37,7 @@ fn default_vol_lookback() -> usize {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AllocationConfig {
     pub strategies: Vec<StrategyConfig>,
     #[serde(default)]

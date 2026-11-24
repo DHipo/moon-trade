@@ -3,7 +3,7 @@
 use moon_telegram::{Incoming, IncomingKind};
 use uuid::Uuid;
 
-use crate::engine::Engine;
+use crate::engine::{Engine, RatioDecision};
 
 /// What the service must do in response to an update.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,7 +21,8 @@ const HELP: &str = "Comandos disponibles:\n\
 /estado: patrimonio, posiciones y estado del bot\n\
 /pausa: frena los rebalanceos (las salidas de emergencia siguen activas)\n\
 /reanudar: reanuda los rebalanceos\n\
-/aceptar <símbolo>: cuenta como movimiento real un posible cambio de ratio pendiente\n\
+/ratio <símbolo>: el posible cambio de ratio pendiente fue un cambio de ratio (se rebasa sin contar caída)\n\
+/caida <símbolo>: fue un movimiento real (se cuenta la caída desde la base)\n\
 /ayuda: muestra esta ayuda";
 
 pub async fn handle_incoming(engine: &Engine, incoming: &Incoming) -> BotAction {
@@ -61,32 +62,22 @@ async fn handle_command(engine: &Engine, name: &str, args: &str) -> String {
             Ok(()) => "▶️ Bot reanudado.".to_string(),
             Err(e) => format!("No se pudo reanudar: {e}"),
         },
-        "aceptar" | "accept" => accept_ratio(engine, args).await,
+        "ratio" => decide_ratio(engine, args, RatioDecision::Ratio),
+        "caida" | "caída" | "drop" => decide_ratio(engine, args, RatioDecision::Drop),
+        "aceptar" | "accept" => {
+            "El comando /aceptar ya no existe. Primero verificá la relación del CEDEAR en BYMA/IOL y después usá /ratio <símbolo> (fue un cambio de ratio) o /caida <símbolo> (fue un movimiento real)."
+                .to_string()
+        }
         _ => HELP.to_string(),
     }
 }
 
-/// `/aceptar <símbolo>`: the pending suspected ratio change counts as a real move; the risk
-/// check runs right away so the breaker sees it.
-async fn accept_ratio(engine: &Engine, args: &str) -> String {
-    let symbol = match engine.accept_ratio_change(args) {
-        Ok(symbol) => symbol,
-        Err(e) => return format!("No se pudo aceptar: {e}"),
-    };
-    match engine.run_risk_check().await {
-        Ok(out) => format!(
-            "✅ Aceptado: el movimiento de {symbol} se cuenta como real. Índice de riesgo {:.4}, caída {:.1}%{}.",
-            out.level,
-            out.drawdown * 100.0,
-            if out.tripped {
-                " · FRENO ACTIVADO"
-            } else {
-                ""
-            }
-        ),
-        Err(e) => format!(
-            "Aceptado: {symbol} se cuenta como movimiento real en el próximo control de riesgo (el control inmediato falló: {e})."
-        ),
+/// `/ratio` and `/caida`: only RECORD the owner's decision about a pending suspected ratio
+/// change; the scheduler applies it at its next risk check, so no check runs from here.
+fn decide_ratio(engine: &Engine, args: &str, decision: RatioDecision) -> String {
+    match engine.decide_ratio_change(args, decision) {
+        Ok(text) => text,
+        Err(e) => format!("No se pudo anotar: {e}"),
     }
 }
 

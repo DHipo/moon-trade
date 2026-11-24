@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail};
+use chrono::NaiveDate;
 use moon_broker::{BrokerError, implied_ccl};
 use moon_core::asset::{AssetId, Currency};
 use moon_core::money::{dec_to_f64, round_money};
@@ -189,6 +190,40 @@ impl Engine {
                 names.join(", ")
             ))
             .await;
+    }
+
+    /// Assets with a pending suspected ratio change: their quantity and price do not match, so
+    /// no plan may buy or sell them (callers add them to the blocked set). The owner is told
+    /// once per day per asset.
+    pub(crate) async fn suspected_assets(&self) -> anyhow::Result<BTreeSet<AssetId>> {
+        let index = self.load_risk_index()?;
+        let mut out = BTreeSet::new();
+        if index.suspicions.is_empty() {
+            return Ok(out);
+        }
+        let today = self.today();
+        for asset in self.universe.tradable() {
+            let Some(exec) = asset.exec.as_ref() else {
+                continue;
+            };
+            if !index.suspicions.contains_key(&exec.symbol) {
+                continue;
+            }
+            out.insert(asset.id.clone());
+            let sym = &exec.symbol;
+            let key = self.state_key(&format!("suspected_skip:{sym}"));
+            if self.db(|s| s.get_state::<NaiveDate>(&key))? == Some(today) {
+                continue;
+            }
+            self.db(|s| s.set_state(&key, &today))?;
+            self.deps
+                .notifier
+                .notify(&format!(
+                    "⚠️ {sym} se omite del plan: tiene un posible cambio de ratio sin resolver. Verificá la relación del CEDEAR en BYMA/IOL y decidí con /ratio {sym} o /caida {sym}."
+                ))
+                .await;
+        }
+        Ok(out)
     }
 
     pub fn plan(

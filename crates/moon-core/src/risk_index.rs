@@ -18,15 +18,17 @@ const CORP_ACTION_MIN_RATIO: f64 = 1.5;
 const CORP_ACTION_VALUE_TOL: f64 = 0.05;
 /// Tolerance around an integer ratio for a price jump with unchanged quantity.
 const PENDING_RATIO_TOL: f64 = 0.03;
+/// Relative tolerance between the quantity multiplier seen and the one the suspicion expects.
+const SUSPECT_QTY_TOL: f64 = 0.05;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AnomalyKind {
     /// Quantity and price moved inversely (ratio change or split): return forced to zero.
     CorporateAction,
     /// Price jumped by an integer ratio while the quantity did not: excluded (zero return, base
-    /// kept) until the quantity updates, the price returns near the base or the owner accepts.
+    /// kept) until the quantity follows, the price returns near the base or the owner decides.
     SuspectedRatioChange,
-    /// The owner accepted a suspected jump: it was counted as a real market move.
+    /// The owner said a suspected jump was a real move: it was counted from the kept base.
     #[serde(alias = "AcceptedAfterConfirmation")]
     AcceptedByOwner,
 }
@@ -38,25 +40,47 @@ pub struct IndexAnomaly {
     pub detail: String,
 }
 
+/// A suspected ratio change: the base the move is measured from and the quantity multiplier
+/// the ratio change would bring (`price / k` goes with `quantity x k`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Suspect {
+    pub base_qty: Decimal,
+    pub base_price: Decimal,
+    pub k: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RiskIndex {
     /// Chained index, starts at 1.0.
     pub level: f64,
     /// Symbol -> quantity at the last observation.
     pub holdings: BTreeMap<String, Decimal>,
-    /// Symbol -> USD unit price used as the base of the next observation.
+    /// Symbol -> USD unit price at the last observation (the base of the next one).
     pub prices_usd: BTreeMap<String, Decimal>,
     pub at: Option<DateTime<Utc>>,
     /// Symbol -> observations spent as a pending suspected ratio change (informational: it never
-    /// expires by count).
+    /// expires by count). The base of each one is in `suspects`.
     #[serde(default)]
     pub suspicions: BTreeMap<String, u32>,
+    /// Symbol -> base and expected multiplier of its pending suspicion. A suspicion saved
+    /// without it (older state) takes the previous holding and price as its base.
+    #[serde(default)]
+    pub suspects: BTreeMap<String, Suspect>,
+    /// Symbols whose quantity jumped by an integer ratio with the price unchanged: zero return
+    /// at that check, rebased at the next one (the price may follow in between).
+    #[serde(default)]
+    pub qty_first: BTreeSet<String>,
     /// Anomalies found by the last `observe` (cleared at the start of each one).
     #[serde(default)]
     pub anomalies: Vec<IndexAnomaly>,
-    /// Pending suspicions the owner accepted: counted as a real move by the next `observe`.
+    /// Pending suspicions the owner said were REAL moves: counted from the base by the next
+    /// `observe`.
+    #[serde(default, alias = "accepted")]
+    pub drops: BTreeSet<String>,
+    /// Pending suspicions the owner said were ratio changes: rebased with zero return by the
+    /// next `observe`.
     #[serde(default)]
-    pub accepted: BTreeSet<String>,
+    pub ratios: BTreeSet<String>,
 }
 
 /// Spanish description of a price move `kp = p_prev / p_now` ("precio ÷2", "precio ×3").
@@ -86,16 +110,33 @@ fn near_integer(x: f64, tol: f64) -> Option<u32> {
     }
 }
 
+fn anomaly(symbol: &str, kind: AnomalyKind, detail: String) -> IndexAnomaly {
+    IndexAnomaly {
+        symbol: symbol.to_string(),
+        kind,
+        detail,
+    }
+}
+
 impl RiskIndex {
-    /// Marks the pending suspicion of `symbol` as accepted by the owner: the next `observe`
-    /// counts the move from the kept base as real and rebases. False when none is pending.
-    pub fn accept(&mut self, symbol: &str) -> bool {
-        if self.suspicions.contains_key(symbol) {
-            self.accepted.insert(symbol.to_string());
-            true
-        } else {
-            false
+    /// Records that the pending suspicion of `symbol` was a REAL move: the next `observe` counts
+    /// it from the kept base and rebases. False when none is pending.
+    pub fn request_drop(&mut self, symbol: &str) -> bool {
+        let pending = self.suspicions.contains_key(symbol);
+        if pending {
+            self.drops.insert(symbol.to_string());
         }
+        pending
+    }
+
+    /// Records that the pending suspicion of `symbol` was a ratio change: the next `observe`
+    /// rebases to the current quantity and price with zero return. False when none is pending.
+    pub fn request_ratio(&mut self, symbol: &str) -> bool {
+        let pending = self.suspicions.contains_key(symbol);
+        if pending {
+            self.ratios.insert(symbol.to_string());
+        }
+        pending
     }
 
     pub fn new() -> Self {
@@ -113,9 +154,12 @@ impl RiskIndex {
     /// `r = 0` when there is nothing invested or no previous observation. A previously held
     /// symbol without a current price is an error and leaves the index untouched.
     ///
-    /// Corporate actions (quantity x k, price / k) and suspected ratio changes (price jumps by an
-    /// integer ratio while the quantity is unchanged) contribute a zero return and are recorded
-    /// in `anomalies`; see [`AnomalyKind`].
+    /// Corporate actions (quantity x k, price / k) contribute a zero return and are recorded in
+    /// `anomalies`. A price jump by an integer ratio with the quantity unchanged becomes a
+    /// suspicion (zero return, base kept) that resolves as a ratio change when the quantity
+    /// reaches the expected multiplier, whatever the price did meanwhile; resumes normally when
+    /// the price returns near the base; ends with zero return when the symbol is no longer held;
+    /// and otherwise waits for the owner (`request_ratio` / `request_drop`). See [`AnomalyKind`].
     pub fn observe(
         &mut self,
         holdings: &BTreeMap<String, Decimal>,
@@ -126,7 +170,8 @@ impl RiskIndex {
         let mut gain = 0.0_f64;
         let mut anomalies: Vec<IndexAnomaly> = Vec::new();
         let mut suspicions: BTreeMap<String, u32> = BTreeMap::new();
-        let mut kept_base: BTreeMap<String, Decimal> = BTreeMap::new();
+        let mut suspects: BTreeMap<String, Suspect> = BTreeMap::new();
+        let mut qty_first: BTreeSet<String> = BTreeSet::new();
         for (sym, qty) in &self.holdings {
             if *qty <= Decimal::ZERO {
                 continue;
@@ -134,8 +179,17 @@ impl RiskIndex {
             let Some(prev) = self.prices_usd.get(sym) else {
                 continue;
             };
-            let q = dec_to_f64(*qty);
-            let p0 = dec_to_f64(*prev);
+            let suspect = self.suspects.get(sym).cloned().or_else(|| {
+                self.suspicions.contains_key(sym).then_some(Suspect {
+                    base_qty: *qty,
+                    base_price: *prev,
+                    k: 0.0,
+                })
+            });
+            let (q, p0) = match &suspect {
+                Some(s) => (dec_to_f64(s.base_qty), dec_to_f64(s.base_price)),
+                None => (dec_to_f64(*qty), dec_to_f64(*prev)),
+            };
             let q_now = holdings.get(sym).copied().unwrap_or(Decimal::ZERO);
             let Some(now) = prices_usd.get(sym) else {
                 if q_now > Decimal::ZERO {
@@ -154,56 +208,146 @@ impl RiskIndex {
             let p1 = dec_to_f64(*now);
             base += q * p0;
 
-            if q_now > Decimal::ZERO && p0 > 0.0 && p1 > 0.0 {
-                let kq = dec_to_f64(q_now) / q;
-                let kp = p0 / p1;
-                let value_ratio = kq / kp;
-                let jump = kq >= CORP_ACTION_MIN_RATIO || kq <= 1.0 / CORP_ACTION_MIN_RATIO;
-                if jump && (value_ratio - 1.0).abs() <= CORP_ACTION_VALUE_TOL {
-                    anomalies.push(IndexAnomaly {
-                        symbol: sym.clone(),
-                        kind: AnomalyKind::CorporateAction,
-                        detail: format!(
-                            "cantidad x{kq:.4} y precio /{kp:.4}: se toma como cambio de ratio o split"
-                        ),
-                    });
-                    continue;
-                }
-                let pending = self.suspicions.contains_key(sym);
-                let back_to_base = (p1 / p0 - 1.0).abs() <= PENDING_RATIO_TOL;
-                if pending && !back_to_base && self.accepted.contains(sym) {
-                    // The owner accepted the jump: it counts as a real move from the kept base.
+            if q_now <= Decimal::ZERO {
+                // No longer held. A suspected symbol that was sold carries no real return (its
+                // base is stale): zero, and the suspicion ends.
+                if suspect.is_none() {
                     gain += q * (p1 - p0);
-                    anomalies.push(IndexAnomaly {
-                        symbol: sym.clone(),
-                        kind: AnomalyKind::AcceptedByOwner,
-                        detail: format!(
-                            "aceptado por el dueño ({}): se cuenta como movimiento real",
+                }
+                continue;
+            }
+            if p0 <= 0.0 || p1 <= 0.0 {
+                gain += q * (p1 - p0);
+                continue;
+            }
+            let kq = dec_to_f64(q_now) / q;
+            let kp = p0 / p1;
+            let price_near_base = (p1 / p0 - 1.0).abs() <= PENDING_RATIO_TOL;
+
+            if let Some(s) = suspect {
+                // A suspicion saved without its multiplier takes it from the current price move
+                // when that is a real jump (otherwise nothing can match).
+                let k = if s.k > 0.0 {
+                    s.k
+                } else if (kp - 1.0).abs() > 0.5 {
+                    kp
+                } else {
+                    0.0
+                };
+                let kq_is_k = k > 0.0 && (kq / k - 1.0).abs() <= SUSPECT_QTY_TOL;
+                let qty_unchanged = (kq - 1.0).abs() <= SUSPECT_QTY_TOL;
+                if self.ratios.contains(sym) {
+                    anomalies.push(anomaly(
+                        sym,
+                        AnomalyKind::CorporateAction,
+                        format!(
+                            "confirmado por el dueño como cambio de ratio ({}): sin retorno, se toma la cantidad y el precio actuales como base",
                             describe_move(kp)
                         ),
-                    });
-                    continue;
-                }
-                // A new suspicion needs an integer ratio with the quantity unchanged. Once
-                // pending it stays pending (zero return, base kept) until the quantity catches
-                // up, the price comes back near the kept base, or the owner accepts it: never by
-                // time or by a further move.
-                let suspected = if pending {
-                    !back_to_base
+                    ));
+                } else if kq_is_k && price_near_base {
+                    // The quantity moved first and the price is where it was: hold one check.
+                    qty_first.insert(sym.clone());
+                    anomalies.push(anomaly(
+                        sym,
+                        AnomalyKind::CorporateAction,
+                        format!(
+                            "cantidad x{kq:.2} con el precio sin cambio: se espera que el precio la siga"
+                        ),
+                    ));
+                } else if kq_is_k {
+                    anomalies.push(anomaly(
+                        sym,
+                        AnomalyKind::CorporateAction,
+                        format!(
+                            "cantidad x{kq:.4} y {}: se toma como cambio de ratio o split",
+                            describe_move(kp)
+                        ),
+                    ));
+                } else if self.drops.contains(sym) && !price_near_base {
+                    gain += q * (p1 - p0);
+                    anomalies.push(anomaly(
+                        sym,
+                        AnomalyKind::AcceptedByOwner,
+                        format!(
+                            "confirmado por el dueño como caída real ({}): se cuenta como movimiento real",
+                            describe_move(kp)
+                        ),
+                    ));
+                } else if price_near_base && qty_unchanged {
+                    // The price came back to where it was: resume normally.
+                    gain += q * (p1 - p0);
                 } else {
-                    q_now == *qty
-                        && (near_integer(kp, PENDING_RATIO_TOL).is_some()
-                            || near_integer(1.0 / kp, PENDING_RATIO_TOL).is_some())
-                };
-                if suspected {
                     let count = self.suspicions.get(sym).copied().unwrap_or(0) + 1;
                     suspicions.insert(sym.clone(), count);
-                    kept_base.insert(sym.clone(), *prev);
-                    anomalies.push(IndexAnomaly {
-                        symbol: sym.clone(),
-                        kind: AnomalyKind::SuspectedRatioChange,
-                        detail: format!("{} sin cambio de cantidad", describe_move(kp)),
-                    });
+                    suspects.insert(sym.clone(), s);
+                    let detail = if qty_unchanged {
+                        format!("{} sin cambio de cantidad", describe_move(kp))
+                    } else {
+                        format!("{}, cantidad x{kq:.2}", describe_move(kp))
+                    };
+                    anomalies.push(anomaly(sym, AnomalyKind::SuspectedRatioChange, detail));
+                }
+                continue;
+            }
+
+            if self.qty_first.contains(sym) {
+                // The quantity jumped at the previous check: whatever the price did since, the
+                // current quantity and price are the new base.
+                anomalies.push(anomaly(
+                    sym,
+                    AnomalyKind::CorporateAction,
+                    "cambio de cantidad ya reflejado: se toma la cantidad y el precio actuales como base"
+                        .to_string(),
+                ));
+                continue;
+            }
+            let jump = kq >= CORP_ACTION_MIN_RATIO || kq <= 1.0 / CORP_ACTION_MIN_RATIO;
+            if jump && (kq / kp - 1.0).abs() <= CORP_ACTION_VALUE_TOL {
+                anomalies.push(anomaly(
+                    sym,
+                    AnomalyKind::CorporateAction,
+                    format!(
+                        "cantidad x{kq:.4} y precio /{kp:.4}: se toma como cambio de ratio o split"
+                    ),
+                ));
+                continue;
+            }
+            let qty_integer_jump = near_integer(kq, PENDING_RATIO_TOL).is_some()
+                || near_integer(1.0 / kq, PENDING_RATIO_TOL).is_some();
+            if qty_integer_jump && price_near_base {
+                qty_first.insert(sym.clone());
+                anomalies.push(anomaly(
+                    sym,
+                    AnomalyKind::CorporateAction,
+                    format!(
+                        "cantidad x{kq:.2} con el precio sin cambio: se espera que el precio la siga"
+                    ),
+                ));
+                continue;
+            }
+            // A new suspicion needs an integer price ratio with the quantity unchanged.
+            if q_now == *qty {
+                let k = if let Some(k) = near_integer(kp, PENDING_RATIO_TOL) {
+                    Some(f64::from(k))
+                } else {
+                    near_integer(1.0 / kp, PENDING_RATIO_TOL).map(|m| 1.0 / f64::from(m))
+                };
+                if let Some(k) = k {
+                    suspicions.insert(sym.clone(), 1);
+                    suspects.insert(
+                        sym.clone(),
+                        Suspect {
+                            base_qty: *qty,
+                            base_price: *prev,
+                            k,
+                        },
+                    );
+                    anomalies.push(anomaly(
+                        sym,
+                        AnomalyKind::SuspectedRatioChange,
+                        format!("{} sin cambio de cantidad", describe_move(kp)),
+                    ));
                     continue;
                 }
             }
@@ -221,11 +365,11 @@ impl RiskIndex {
             .map(|(s, q)| (s.clone(), *q))
             .collect();
         self.prices_usd = prices_usd.clone();
-        for (sym, p) in kept_base {
-            self.prices_usd.insert(sym, p);
-        }
         self.suspicions = suspicions;
-        self.accepted.clear();
+        self.suspects = suspects;
+        self.qty_first = qty_first;
+        self.drops.clear();
+        self.ratios.clear();
         self.anomalies = anomalies;
         self.at = Some(at);
         Ok(r)
@@ -413,7 +557,7 @@ mod tests {
         assert_eq!(r, 0.0);
         assert_eq!(idx.level, 1.0);
         assert_eq!(idx.anomalies[0].kind, AnomalyKind::SuspectedRatioChange);
-        assert_eq!(idx.prices_usd["A"], dec!(10));
+        assert_eq!(idx.suspects["A"].base_price, dec!(10));
         assert_eq!(idx.suspicions["A"], 1);
         // The quantity catches up: the corporate action is recognised against the kept base.
         let r = idx
@@ -447,7 +591,7 @@ mod tests {
             assert_eq!(r, 0.0, "observation {day}");
             assert_eq!(idx.level, 1.0);
             assert_eq!(idx.anomalies[0].kind, AnomalyKind::SuspectedRatioChange);
-            assert_eq!(idx.prices_usd["A"], dec!(10), "base kept");
+            assert_eq!(idx.suspects["A"].base_price, dec!(10), "base kept");
         }
     }
 
@@ -462,7 +606,7 @@ mod tests {
         assert_eq!(r, 0.0);
         assert_eq!(idx.level, 1.0);
         assert_eq!(idx.anomalies[0].kind, AnomalyKind::SuspectedRatioChange);
-        assert_eq!(idx.prices_usd["A"], dec!(10));
+        assert_eq!(idx.suspects["A"].base_price, dec!(10));
     }
 
     #[test]
@@ -478,21 +622,21 @@ mod tests {
     }
 
     #[test]
-    fn owner_acceptance_counts_the_move_from_the_kept_base_once() {
+    fn owner_drop_counts_the_move_from_the_kept_base_once() {
         let mut idx = RiskIndex::new();
         prev(&mut idx, dec!(10), dec!(10));
         let h = map(&[("A", dec!(10))]);
         let p = map(&[("A", dec!(5))]);
         idx.observe(&h, &p, t(2)).unwrap();
-        assert!(idx.accept("A"));
-        assert!(!idx.accept("B"), "nothing pending for B");
+        assert!(idx.request_drop("A"));
+        assert!(!idx.request_drop("B"), "nothing pending for B");
         let r = idx.observe(&h, &p, t(3)).unwrap();
         assert!((r + 0.5).abs() < 1e-12);
         assert!((idx.level - 0.5).abs() < 1e-12);
         assert_eq!(idx.anomalies[0].kind, AnomalyKind::AcceptedByOwner);
         assert!(idx.anomalies[0].detail.contains("movimiento real"));
         assert_eq!(idx.prices_usd["A"], dec!(5));
-        assert!(idx.suspicions.is_empty() && idx.accepted.is_empty());
+        assert!(idx.suspicions.is_empty() && idx.drops.is_empty());
         // Counted once: afterwards nothing is suspicious.
         idx.observe(&h, &p, t(4)).unwrap();
         assert!(idx.anomalies.is_empty());
@@ -505,7 +649,7 @@ mod tests {
         prev(&mut idx, dec!(10), dec!(10));
         idx.observe(&map(&[("A", dec!(10))]), &map(&[("A", dec!(5))]), t(2))
             .unwrap();
-        idx.accept("A");
+        idx.request_drop("A");
         // The quantity update arrives together with the owner's acceptance: no loss counted.
         let r = idx
             .observe(&map(&[("A", dec!(20))]), &map(&[("A", dec!(5))]), t(3))
@@ -520,7 +664,7 @@ mod tests {
             "anomalies":[{"symbol":"A","kind":"AcceptedAfterConfirmation","detail":"x"}]}"#;
         let loaded: RiskIndex = serde_json::from_str(old).unwrap();
         assert_eq!(loaded.anomalies[0].kind, AnomalyKind::AcceptedByOwner);
-        assert!(loaded.accepted.is_empty());
+        assert!(loaded.drops.is_empty());
     }
 
     #[test]
@@ -547,5 +691,124 @@ mod tests {
         let old = r#"{"level":1.0,"holdings":{},"prices_usd":{},"at":null}"#;
         let loaded: RiskIndex = serde_json::from_str(old).unwrap();
         assert!(loaded.suspicions.is_empty() && loaded.anomalies.is_empty());
+    }
+
+    #[test]
+    fn quantity_arriving_after_a_price_move_resolves_the_suspicion() {
+        // S2: ratio 2:1; the price halves first, the quantity arrives later with the price 8 % lower.
+        let mut idx = RiskIndex::new();
+        prev(&mut idx, dec!(100), dec!(10));
+        idx.observe(&map(&[("A", dec!(100))]), &map(&[("A", dec!(5))]), t(2))
+            .unwrap();
+        assert_eq!(idx.suspects["A"].k, 2.0);
+        let r = idx
+            .observe(&map(&[("A", dec!(200))]), &map(&[("A", dec!(4.6))]), t(3))
+            .unwrap();
+        assert_eq!(r, 0.0);
+        assert_eq!(idx.level, 1.0);
+        assert_eq!(idx.anomalies[0].kind, AnomalyKind::CorporateAction);
+        assert!(idx.suspicions.is_empty() && idx.suspects.is_empty());
+        assert_eq!(idx.holdings["A"], dec!(200));
+        assert_eq!(idx.prices_usd["A"], dec!(4.6));
+    }
+
+    #[test]
+    fn inverse_ratio_resolves_when_the_quantity_shrinks() {
+        let mut idx = RiskIndex::new();
+        prev(&mut idx, dec!(100), dec!(10));
+        idx.observe(&map(&[("A", dec!(100))]), &map(&[("A", dec!(30))]), t(2))
+            .unwrap();
+        assert!((idx.suspects["A"].k - 1.0 / 3.0).abs() < 1e-12);
+        let r = idx
+            .observe(&map(&[("A", dec!(33.4))]), &map(&[("A", dec!(30))]), t(3))
+            .unwrap();
+        assert_eq!(r, 0.0);
+        assert!(idx.suspicions.is_empty());
+    }
+
+    #[test]
+    fn quantity_first_holds_one_check_then_rebases() {
+        // S11: the quantity doubles with the price unchanged; the price halves a check later.
+        let mut idx = RiskIndex::new();
+        prev(&mut idx, dec!(100), dec!(10));
+        let r = idx
+            .observe(&map(&[("A", dec!(200))]), &map(&[("A", dec!(10))]), t(2))
+            .unwrap();
+        assert_eq!(r, 0.0);
+        assert!(idx.qty_first.contains("A"));
+        let r = idx
+            .observe(&map(&[("A", dec!(200))]), &map(&[("A", dec!(5))]), t(3))
+            .unwrap();
+        assert_eq!(r, 0.0, "the price following is not a loss");
+        assert!(idx.qty_first.is_empty() && idx.suspicions.is_empty());
+        let r = idx
+            .observe(&map(&[("A", dec!(200))]), &map(&[("A", dec!(5.5))]), t(4))
+            .unwrap();
+        assert!((r - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn selling_a_suspected_symbol_counts_zero_and_drops_the_suspicion() {
+        // S3: the suspected asset is sold while its quote is still halved.
+        let mut idx = RiskIndex::new();
+        idx.observe(
+            &map(&[("A", dec!(100)), ("B", dec!(100))]),
+            &map(&[("A", dec!(10)), ("B", dec!(10))]),
+            t(1),
+        )
+        .unwrap();
+        idx.observe(
+            &map(&[("A", dec!(100)), ("B", dec!(100))]),
+            &map(&[("A", dec!(5)), ("B", dec!(10))]),
+            t(2),
+        )
+        .unwrap();
+        let r = idx
+            .observe(
+                &map(&[("B", dec!(100))]),
+                &map(&[("A", dec!(5)), ("B", dec!(10))]),
+                t(3),
+            )
+            .unwrap();
+        assert_eq!(r, 0.0);
+        assert_eq!(idx.level, 1.0);
+        assert!(idx.suspicions.is_empty() && idx.suspects.is_empty());
+    }
+
+    #[test]
+    fn owner_ratio_rebases_with_zero_return() {
+        let mut idx = RiskIndex::new();
+        prev(&mut idx, dec!(100), dec!(10));
+        let h = map(&[("A", dec!(100))]);
+        idx.observe(&h, &map(&[("A", dec!(5))]), t(2)).unwrap();
+        assert!(idx.request_ratio("A"));
+        assert!(!idx.request_ratio("B"));
+        let r = idx.observe(&h, &map(&[("A", dec!(4.6))]), t(3)).unwrap();
+        assert_eq!(r, 0.0);
+        assert_eq!(idx.anomalies[0].kind, AnomalyKind::CorporateAction);
+        assert!(idx.suspicions.is_empty() && idx.ratios.is_empty());
+        assert_eq!(idx.prices_usd["A"], dec!(4.6));
+    }
+
+    #[test]
+    fn a_request_for_a_symbol_that_is_not_pending_is_refused() {
+        let mut idx = RiskIndex::new();
+        prev(&mut idx, dec!(100), dec!(10));
+        assert!(!idx.request_drop("A"));
+        assert!(idx.drops.is_empty());
+    }
+
+    #[test]
+    fn suspicion_saved_by_the_previous_version_still_resolves() {
+        let old = r#"{"level":1.0,"holdings":{"A":"100"},"prices_usd":{"A":"10"},"at":null,
+            "suspicions":{"A":3}}"#;
+        let mut idx: RiskIndex = serde_json::from_str(old).unwrap();
+        assert!(idx.suspects.is_empty());
+        // The quantity arrives with the price down 55 %: recognised against the base.
+        let r = idx
+            .observe(&map(&[("A", dec!(222))]), &map(&[("A", dec!(4.5))]), t(2))
+            .unwrap();
+        assert_eq!(r, 0.0);
+        assert!(idx.suspicions.is_empty());
     }
 }

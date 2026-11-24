@@ -30,8 +30,9 @@ use super::text::{execution_summary, proposal_text};
 use super::{
     Engine, ExecutionReport, MonthlyAttempt, MonthlyOutcome, ORDER_BLOCKED, RiskOutcome,
     STATE_DEPOSIT_PENDING, STATE_DRAWDOWN, STATE_EMERGENCY_REFUGE, STATE_EMERGENCY_UNKNOWN,
-    STATE_FLOWS_CHECKED, STATE_MONTHLY_ATTEMPT, STATE_NAV, STATE_PAPER_INIT, STATE_RISK_ACCEPT,
-    STATE_RISK_INDEX, UNKNOWN_OUTCOME, Valuation, art_day_bounds, last_day_of_previous_month,
+    STATE_FLOWS_CHECKED, STATE_MONTHLY_ATTEMPT, STATE_NAV, STATE_PAPER_INIT, STATE_RISK_DROP,
+    STATE_RISK_INDEX, STATE_RISK_RATIO, UNKNOWN_OUTCOME, Valuation, art_day_bounds,
+    last_day_of_previous_month,
 };
 use crate::commands::data::fetch_update;
 use crate::config::TradingMode;
@@ -94,7 +95,7 @@ impl Engine {
 
         // Orders of this month that are still working (or whose outcome is unknown) are never
         // duplicated: their assets are left out of the plan.
-        let (blocked, notes) = self.working_assets(today).await?;
+        let (mut blocked, notes) = self.working_assets(today).await?;
         self.notify_blocked(&blocked, &notes).await;
 
         let v = self.valuation().await?;
@@ -108,6 +109,7 @@ impl Engine {
 
         let targets = decision.final_weights.clone();
         let mut plan = self.plan(&targets, &v, false)?;
+        blocked.extend(self.suspected_assets().await?);
         plan.orders.retain(|o| !blocked.contains(&o.asset));
         if plan.is_empty() {
             self.finish_monthly_decision(&mut drawdown, index.level)?;
@@ -394,17 +396,26 @@ impl Engine {
             .iter()
             .map(|p| (p.symbol.clone(), p.price_ars / v.ccl))
             .collect();
-        // Acceptances the owner requested (Telegram or CLI) apply to this observation.
-        let accept_key = self.state_key(STATE_RISK_ACCEPT);
-        let accepted: Vec<String> = self.db(|s| s.get_state(&accept_key))?.unwrap_or_default();
-        for sym in &accepted {
-            index.accept(sym);
+        // Decisions the owner recorded (Telegram or CLI) apply to this observation: the commands
+        // never run a risk check themselves.
+        let drop_key = self.state_key(STATE_RISK_DROP);
+        let ratio_key = self.state_key(STATE_RISK_RATIO);
+        let drops: Vec<String> = self.db(|s| s.get_state(&drop_key))?.unwrap_or_default();
+        let ratios: Vec<String> = self.db(|s| s.get_state(&ratio_key))?.unwrap_or_default();
+        for sym in &drops {
+            index.request_drop(sym);
+        }
+        for sym in &ratios {
+            index.request_ratio(sym);
         }
         let r = index
             .observe(&holdings, &prices, v.at)
             .map_err(|e| anyhow!("no se pudo actualizar el índice de riesgo: {e}"))?;
-        if !accepted.is_empty() {
-            self.db(|s| s.delete_state(&accept_key))?;
+        if !drops.is_empty() {
+            self.db(|s| s.delete_state(&drop_key))?;
+        }
+        if !ratios.is_empty() {
+            self.db(|s| s.delete_state(&ratio_key))?;
         }
         // Each anomaly is announced once per symbol and kind per day.
         let today = self.today();
@@ -417,7 +428,7 @@ impl Engine {
             self.db(|s| s.set_state(&key, &today))?;
             let text = match a.kind {
                 AnomalyKind::SuspectedRatioChange => format!(
-                    "⚠️ Índice de riesgo: posible cambio de ratio en {sym} ({detail}). No se cuenta como caída hasta que IOL actualice la tenencia o lo aceptes con /aceptar {sym}.",
+                    "⚠️ Índice de riesgo: posible cambio de ratio en {sym} ({detail}). No se cuenta como caída ni como suba y el activo se excluye de los planes mientras tanto. Primero verificá la relación del CEDEAR en BYMA/IOL. Si fue un cambio de ratio: /ratio {sym} (o `moon risk ratio {sym}`). Si fue un movimiento real de precio: /caida {sym} (o `moon risk drop {sym}`). Se aplica en el próximo control de riesgo en horario de rueda; si IOL actualiza la cantidad antes, se resuelve solo.",
                     sym = a.symbol,
                     detail = a.detail
                 ),
@@ -509,7 +520,7 @@ impl Engine {
 
         self.db(|s| s.set_proposal_status(proposal_id, ProposalStatus::Approved, now))?;
         let outcome = async {
-            let (blocked, notes) = self.working_assets(self.today()).await?;
+            let (mut blocked, notes) = self.working_assets(self.today()).await?;
             self.notify_blocked(&blocked, &notes).await;
             let v = self.valuation().await?;
             self.notify_unpriced(&v).await;
@@ -517,6 +528,7 @@ impl Engine {
             if deposit {
                 plan.orders.retain(|o| o.side == Side::Buy);
             }
+            blocked.extend(self.suspected_assets().await?);
             plan.orders.retain(|o| !blocked.contains(&o.asset));
             if plan.is_empty() {
                 return anyhow::Ok(Approval::NothingToDo);
@@ -1428,11 +1440,12 @@ impl Engine {
             // No monthly decision yet: the first monthly rebalance invests the deposit.
             return Ok(());
         };
-        let (blocked, notes) = self.working_assets(self.today()).await?;
+        let (mut blocked, notes) = self.working_assets(self.today()).await?;
         self.notify_blocked(&blocked, &notes).await;
         self.notify_unpriced(v).await;
         let mut plan = self.plan(&targets, v, false)?;
         plan.orders.retain(|o| o.side == Side::Buy);
+        blocked.extend(self.suspected_assets().await?);
         plan.orders.retain(|o| !blocked.contains(&o.asset));
         if plan.is_empty() {
             self.db(|s| s.delete_state(&key))?;

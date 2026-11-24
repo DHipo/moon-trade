@@ -72,11 +72,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             let cfg = AppConfig::load(&cli.config)?;
             commands::orders::run_list(&cfg, unknown)
         }
-        Command::Risk {
-            cmd: RiskCmd::Accept { symbol },
-        } => {
+        Command::Risk { cmd } => {
+            let (symbol, decision) = match cmd {
+                RiskCmd::Ratio { symbol } => (symbol, engine::RatioDecision::Ratio),
+                RiskCmd::Drop { symbol } => (symbol, engine::RatioDecision::Drop),
+            };
             let cfg = AppConfig::load(&cli.config)?;
-            commands::risk::run_accept(&cfg, &symbol)
+            commands::risk::run_decision(&cfg, &symbol, decision)
         }
         Command::Pause => {
             let cfg = AppConfig::load(&cli.config)?;

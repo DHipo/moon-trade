@@ -89,9 +89,15 @@ pub enum CheckCmd {
 
 #[derive(Subcommand)]
 pub enum RiskCmd {
-    /// Acepta como movimiento real un posible cambio de ratio pendiente (se aplica en el
-    /// próximo control de riesgo del servicio)
-    Accept {
+    /// El posible cambio de ratio pendiente fue un cambio de ratio: se rebasa sin contar caída
+    /// (se aplica en el próximo control de riesgo del servicio; no corre ningún control)
+    Ratio {
+        /// Símbolo con el posible cambio de ratio (el que muestra el aviso o `moon status`)
+        symbol: String,
+    },
+    /// El posible cambio de ratio pendiente fue un movimiento real: se cuenta desde la base
+    /// (se aplica en el próximo control de riesgo del servicio; no corre ningún control)
+    Drop {
         /// Símbolo con el posible cambio de ratio (el que muestra el aviso o `moon status`)
         symbol: String,
     },

@@ -72,6 +72,47 @@ impl Engine {
         emergency: bool,
         excluded: &BTreeSet<AssetId>,
     ) -> anyhow::Result<ExecutionReport> {
+        self.execute_inner(plan, targets, reason, batch_id, emergency, excluded, false)
+            .await
+    }
+
+    /// Buys the refuge after an emergency exit: the normal tranche splitting applies, but the
+    /// daily order limit does not (getting into the refuge must not be blocked by the sells and
+    /// earlier orders of the day).
+    pub(crate) async fn execute_refuge_buy(
+        &self,
+        plan: &RebalancePlan,
+        targets: &TargetWeights,
+        batch_id: Uuid,
+    ) -> anyhow::Result<ExecutionReport> {
+        self.execute_inner(
+            plan,
+            targets,
+            OrderReason::Emergency,
+            batch_id,
+            false,
+            &BTreeSet::new(),
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_inner(
+        &self,
+        plan: &RebalancePlan,
+        targets: &TargetWeights,
+        reason: OrderReason,
+        batch_id: Uuid,
+        emergency: bool,
+        excluded: &BTreeSet<AssetId>,
+        exempt_daily_limit: bool,
+    ) -> anyhow::Result<ExecutionReport> {
+        let max_orders_per_day = if exempt_daily_limit {
+            u32::MAX
+        } else {
+            self.cfg.risk.max_orders_per_day
+        };
         // Emergency exits never depend on the CCL (their order checks ignore the size limit).
         let ccl = self
             .db(|s| s.latest_fx())?
@@ -109,7 +150,7 @@ impl Engine {
         if let Err(violation) = check_orders(
             &checked,
             round_money(self.cfg.risk.max_order_usd * ccl),
-            self.cfg.risk.max_orders_per_day,
+            max_orders_per_day,
             already,
             emergency,
         ) {
@@ -137,13 +178,18 @@ impl Engine {
                 break;
             }
         }
-        if !halted && !ids.is_empty() {
+        // Emergency sells are not awaited here: the risk check waits for them afterwards (up to
+        // `emergency_fill_wait_seconds`) so the refuge is bought as soon as they fill.
+        if !halted && !ids.is_empty() && !emergency {
             self.wait_for_fills(&ids).await;
         }
 
         // Phase 2: buys recomputed from the broker's real cash.
         if !halted && !emergency {
-            match self.recompute_buys(targets, batch_id, excluded).await {
+            match self
+                .recompute_buys(targets, batch_id, excluded, max_orders_per_day)
+                .await
+            {
                 Ok((buys, cash)) => {
                     let mut cash_left = cash;
                     for (order, tranche) in &buys {
@@ -264,6 +310,7 @@ impl Engine {
         targets: &TargetWeights,
         batch_id: Uuid,
         excluded: &BTreeSet<AssetId>,
+        max_orders_per_day: u32,
     ) -> anyhow::Result<(Vec<(PlannedOrder, u32)>, Decimal)> {
         let v = self.valuation().await?;
         let plan = self.plan(targets, &v, false)?;
@@ -279,7 +326,7 @@ impl Engine {
         check_orders(
             &checked,
             round_money(self.cfg.risk.max_order_usd * v.ccl),
-            self.cfg.risk.max_orders_per_day,
+            max_orders_per_day,
             already,
             false,
         )?;

@@ -37,6 +37,9 @@ use crate::config::TradingMode;
 
 const PAPER_ONLY: &str = "Solo disponible en modo paper.";
 
+/// Last time a refuge-buy failure was notified (per mode), to notify at most once per hour.
+const STATE_REFUGE_NOTICE: &str = "emergency_refuge_notified";
+
 impl Engine {
     // --- monthly rebalance ---
 
@@ -550,15 +553,49 @@ impl Engine {
     }
 
     async fn refuge_buy_best_effort(&self, drawdown: &DrawdownState) {
+        // Wait for the sells to fill (only when there is a refuge to buy), then buy it in this check.
+        match self.refuge_pending(drawdown) {
+            Ok(true) => self.wait_for_emergency_fills().await,
+            Ok(false) => {}
+            Err(e) => tracing::warn!("no se pudo leer el estado del refugio: {e}"),
+        }
         if let Err(e) = self.emergency_refuge_buy(drawdown).await {
             tracing::error!("compra del refugio tras la salida de emergencia: {e}");
+            if !self.refuge_notice_due() {
+                return;
+            }
             self.deps
                 .notifier
                 .notify(&format!(
-                    "⚠️ No se pudo completar la compra del refugio tras el freno por caída: {e}"
+                    "⚠️ No se pudo completar la compra del refugio tras el freno por caída: {e}. Se reintenta en el próximo control."
                 ))
                 .await;
         }
+    }
+
+    /// True when the refuge is not CASH and has not been handled yet in this trip.
+    fn refuge_pending(&self, drawdown: &DrawdownState) -> anyhow::Result<bool> {
+        if self.universe.refuge().id.is_cash() {
+            return Ok(false);
+        }
+        let marker = drawdown.tripped_on.unwrap_or_else(|| self.today());
+        let key = self.state_key(STATE_EMERGENCY_REFUGE);
+        let done: Option<NaiveDate> = self.db(|s| s.get_state(&key))?;
+        Ok(done != Some(marker))
+    }
+
+    /// Refuge-buy failures are notified at most once per hour (the retry happens every check).
+    fn refuge_notice_due(&self) -> bool {
+        let key = self.state_key(STATE_REFUGE_NOTICE);
+        let now = self.now();
+        let last: Option<DateTime<Utc>> = self.db(|s| s.get_state(&key)).ok().flatten();
+        if last.is_some_and(|t| now - t < Duration::hours(1)) {
+            return false;
+        }
+        if let Err(e) = self.db(|s| s.set_state(&key, &now)) {
+            tracing::warn!("no se pudo guardar el aviso del refugio: {e}");
+        }
+        true
     }
 
     /// Sells what is still held in risky assets, once per asset unless an order is already
@@ -583,6 +620,18 @@ impl Engine {
                 .notifier
                 .notify(&format!(
                     "🚨 Freno por caída: órdenes abiertas canceladas.\n• {}",
+                    notes.join("\n• ")
+                ))
+                .await;
+        }
+
+        // Refresh the emergency orders and replace the limit orders that did not fill in time.
+        let notes = self.reprice_emergency_orders().await?;
+        if !notes.is_empty() {
+            self.deps
+                .notifier
+                .notify(&format!(
+                    "🚨 Freno por caída: ventas de emergencia sin ejecutar.\n• {}",
                     notes.join("\n• ")
                 ))
                 .await;
@@ -623,7 +672,8 @@ impl Engine {
                 .await;
         }
 
-        let mut candidates: Vec<(AssetId, String, Decimal)> = Vec::new();
+        // (asset, symbol, qty, force_market)
+        let mut candidates: Vec<(AssetId, String, Decimal, bool)> = Vec::new();
         let mut unknown: Vec<String> = Vec::new();
         for (asset, symbol, qty) in held {
             let mine: Vec<&OrderRecord> = emergency_orders
@@ -643,7 +693,11 @@ impl Engine {
                 unknown.push(symbol);
                 continue; // never re-send an order whose outcome is unknown
             }
-            candidates.push((asset, symbol, qty));
+            // A limit order that did not fill (rejected or cancelled) is replaced by a market order.
+            let force_market = mine
+                .iter()
+                .any(|o| o.limit_price.is_some() && o.status != OrderStatus::Filled);
+            candidates.push((asset, symbol, qty, force_market));
         }
 
         if !unknown.is_empty() {
@@ -674,17 +728,26 @@ impl Engine {
         }
 
         let mut orders: Vec<PlannedOrder> = Vec::new();
-        for (asset, symbol, qty) in &candidates {
+        let now = self.now();
+        for (asset, symbol, qty, force_market) in &candidates {
             let market = self
                 .universe
                 .get(asset)
                 .and_then(|a| a.exec.as_ref())
                 .map(|e| e.market);
-            // A fresh quote gives an aggressive limit; without one the order goes at market.
+            // A fresh quote gives an aggressive limit; without one (or after a limit order that
+            // did not fill) the order goes at market.
             let ref_price = match market {
+                _ if *force_market => Decimal::ZERO,
                 Some(m) => match self.deps.quotes.quote(symbol, m).await {
-                    Ok(q) if q.price > Decimal::ZERO => q.price,
-                    Ok(_) => Decimal::ZERO,
+                    Ok(q) if q.price > Decimal::ZERO && q.is_fresh(now) => q.price,
+                    Ok(q) => {
+                        tracing::warn!(
+                            "la cotización de {symbol} no es fresca ({}): la venta de emergencia va a mercado",
+                            q.at
+                        );
+                        Decimal::ZERO
+                    }
                     Err(e) => {
                         tracing::warn!(
                             "sin cotización de {symbol} para la venta de emergencia: {e}"
@@ -734,6 +797,98 @@ impl Engine {
         Ok(Some(report))
     }
 
+    /// Refreshes every non-terminal emergency order. A still-unfilled emergency LIMIT sell older
+    /// than `emergency_reprice_minutes` is cancelled so the sweep re-sends it at market for what is
+    /// still held. Orders without a broker id or whose cancel failed are left alone (never
+    /// duplicated). Returns notes for the owner.
+    async fn reprice_emergency_orders(&self) -> anyhow::Result<Vec<String>> {
+        let mode = self.exec_mode();
+        let window = Duration::minutes(i64::from(self.cfg.execution.emergency_reprice_minutes));
+        let mut notes = Vec::new();
+        let open: Vec<OrderRecord> = self
+            .db(|s| s.open_orders(mode))?
+            .into_iter()
+            .filter(|o| o.reason == OrderReason::Emergency)
+            .collect();
+        for mut order in open {
+            let Some(broker_id) = order.broker_order_id.clone() else {
+                continue;
+            };
+            if let Err(e) = self.refresh_order(&mut order).await {
+                tracing::warn!(
+                    "no se pudo actualizar la orden de emergencia {}: {e}",
+                    order.id
+                );
+                continue;
+            }
+            let stale = !order.status.is_terminal()
+                && order.side == Side::Sell
+                && order.limit_price.is_some()
+                && self.now() - order.created_at >= window;
+            if !stale {
+                continue;
+            }
+            if let Err(e) = self.deps.broker.cancel(&broker_id).await {
+                notes.push(format!(
+                    "No se pudo cancelar la venta de {} a límite: {e}. Sigue vigente y no se reenvía.",
+                    order.symbol
+                ));
+                continue;
+            }
+            if let Err(e) = self.refresh_order(&mut order).await {
+                tracing::warn!(
+                    "no se pudo actualizar la orden de emergencia {}: {e}",
+                    order.id
+                );
+            }
+            if !order.status.is_terminal() {
+                order.status = OrderStatus::Cancelled;
+                order.updated_at = self.now();
+                self.db(|s| s.update_order(&order))?;
+            }
+            notes.push(format!(
+                "La venta de {} a límite no se ejecutó en {} minutos: se cancela y se reenvía a mercado.",
+                order.symbol, self.cfg.execution.emergency_reprice_minutes
+            ));
+        }
+        Ok(notes)
+    }
+
+    /// Polls the working emergency orders until none is left or `emergency_fill_wait_seconds`
+    /// pass, so the refuge can be bought in the same risk check.
+    async fn wait_for_emergency_fills(&self) {
+        let wait = std::time::Duration::from_secs(u64::from(
+            self.cfg.execution.emergency_fill_wait_seconds,
+        ));
+        let poll =
+            std::time::Duration::from_secs(u64::from(self.cfg.execution.poll_interval_seconds))
+                .max(std::time::Duration::from_millis(50));
+        let start = std::time::Instant::now();
+        let mode = self.exec_mode();
+        loop {
+            let working: Vec<OrderRecord> = match self.db(|s| s.open_orders(mode)) {
+                Ok(v) => v
+                    .into_iter()
+                    .filter(|o| o.reason == OrderReason::Emergency && o.broker_order_id.is_some())
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!("no se pudieron leer las órdenes de emergencia: {e}");
+                    return;
+                }
+            };
+            let elapsed = start.elapsed();
+            if working.is_empty() || elapsed >= wait {
+                return;
+            }
+            tokio::time::sleep(poll.min(wait - elapsed)).await;
+            for mut o in working {
+                if let Err(e) = self.refresh_order(&mut o).await {
+                    tracing::warn!("no se pudo actualizar la orden {}: {e}", o.id);
+                }
+            }
+        }
+    }
+
     /// With a non-CASH refuge: once nothing risky is held and no emergency order is working,
     /// buys the refuge once per trip, within the normal order limits.
     async fn emergency_refuge_buy(&self, drawdown: &DrawdownState) -> anyhow::Result<()> {
@@ -747,6 +902,13 @@ impl Engine {
             return Ok(());
         }
         let v = self.valuation().await?;
+        // Without a refuge quote the plan would silently fall back to CASH: that is an error to
+        // notify and retry, never "done".
+        if v.unpriced.contains(&refuge) {
+            bail!(
+                "no hay cotización del refugio {refuge}: no se puede comprar y la plata sigue en pesos"
+            );
+        }
         if v.positions
             .iter()
             .any(|p| p.asset != refuge && p.qty > Decimal::ZERO)
@@ -805,15 +967,10 @@ impl Engine {
             skipped: full.skipped,
             est_cash_after: full.est_cash_after,
         };
-        // Normal (non-emergency) limits apply; if they block the buy, `execute` notifies.
+        // The order size limit applies (tranches); the daily order limit does not. If the size
+        // limit blocks the buy, `execute` notifies.
         let result = self
-            .execute(
-                &plan,
-                &targets,
-                OrderReason::Emergency,
-                Uuid::new_v4(),
-                false,
-            )
+            .execute_refuge_buy(&plan, &targets, Uuid::new_v4())
             .await;
         match result {
             // A definite failure (rejection) leaves the marker unset so the next check retries;

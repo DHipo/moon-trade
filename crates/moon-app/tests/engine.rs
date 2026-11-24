@@ -1,6 +1,6 @@
 mod common;
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use common::{Harness, TODAY, clock_time, test_config, try_engine};
 use moon_app::config::TradingMode;
 use moon_app::engine::{
@@ -545,9 +545,9 @@ async fn rejected_emergency_sell_is_retried_with_a_new_batch() {
     let places = h.fake().places();
     assert_eq!(places.len(), 1);
     assert_eq!(places[0].side, Side::Sell);
-    // A fresh quote gives an aggressive limit: 10,000 x (1 - 0.03).
-    assert_eq!(places[0].order_type, moon_core::types::OrderType::Limit);
-    assert_eq!(places[0].limit_price, Some(dec!(9700)));
+    // The first attempt was a rejected limit order: the retry goes at market.
+    assert_eq!(places[0].order_type, moon_core::types::OrderType::Market);
+    assert_eq!(places[0].limit_price, None);
 
     let orders = emergency_orders(&h);
     assert_eq!(orders.len(), 2);
@@ -1195,4 +1195,226 @@ async fn rejected_refuge_buy_is_retried() {
 
     h.engine.run_risk_check().await.expect("third check");
     assert_eq!(h.fake().places().len(), 2);
+}
+
+// --- live readiness P1: repricing, fast refuge, refuge without quote ---
+
+use moon_core::types::OrderType;
+
+#[tokio::test]
+async fn fresh_quote_gives_an_aggressive_limit_on_the_first_attempt() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    arm_breaker(&h);
+    h.engine.run_risk_check().await.expect("check");
+    let places = h.fake().places();
+    assert_eq!(places.len(), 1);
+    assert_eq!(places[0].order_type, OrderType::Limit);
+    assert_eq!(places[0].limit_price, Some(dec!(9700)));
+}
+
+#[tokio::test]
+async fn stale_quote_sends_the_first_emergency_sell_at_market() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    arm_breaker(&h);
+    h.quotes
+        .set_at("AAA", Market::Bcba, clock_time() - Duration::minutes(45));
+    h.engine.run_risk_check().await.expect("check");
+    let places = h.fake().places();
+    assert_eq!(places.len(), 1);
+    assert_eq!(places[0].order_type, OrderType::Market);
+    assert_eq!(places[0].limit_price, None);
+}
+
+#[tokio::test]
+async fn quote_from_a_previous_day_is_stale() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    arm_breaker(&h);
+    // 00:10 ART; the quote is 20 minutes old but from 23:50 ART of the day before.
+    let now = Utc
+        .with_ymd_and_hms(2026, 11, 23, 3, 10, 0)
+        .single()
+        .expect("t");
+    h.clock.set(now);
+    h.quotes
+        .set_at("AAA", Market::Bcba, now - Duration::minutes(20));
+    h.engine.run_risk_check().await.expect("check");
+    assert_eq!(h.fake().places()[0].order_type, OrderType::Market);
+}
+
+#[tokio::test]
+async fn unfilled_limit_older_than_the_window_is_cancelled_and_resent_at_market() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    arm_breaker(&h);
+    h.engine.run_risk_check().await.expect("trip");
+    assert_eq!(h.fake().places()[0].order_type, OrderType::Limit);
+
+    h.clock.advance(Duration::minutes(11));
+    h.engine.run_risk_check().await.expect("reprice");
+    assert_eq!(h.fake().cancels().len(), 1);
+    let places = h.fake().places();
+    assert_eq!(places.len(), 2, "{places:?}");
+    assert_eq!(places[1].side, Side::Sell);
+    assert_eq!(places[1].qty, dec!(100));
+    assert_eq!(places[1].order_type, OrderType::Market);
+    assert_eq!(places[1].limit_price, None);
+    let orders = emergency_orders(&h);
+    assert_eq!(orders.len(), 2);
+    assert_eq!(orders[0].status, OrderStatus::Cancelled);
+    assert_eq!(orders[1].status, OrderStatus::Sent);
+    assert_ne!(orders[0].batch_id, orders[1].batch_id);
+
+    // The market order is not cancelled and re-sent again, however old it gets.
+    h.clock.advance(Duration::minutes(30));
+    h.engine.run_risk_check().await.expect("later");
+    assert_eq!(h.fake().places().len(), 2);
+    assert_eq!(h.fake().cancels().len(), 1);
+}
+
+#[tokio::test]
+async fn working_emergency_order_younger_than_the_window_is_left_alone() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    arm_breaker(&h);
+    h.engine.run_risk_check().await.expect("trip");
+    h.clock.advance(Duration::minutes(9));
+    h.engine.run_risk_check().await.expect("check");
+    assert!(h.fake().cancels().is_empty());
+    assert_eq!(h.fake().places().len(), 1);
+    assert_eq!(emergency_orders(&h)[0].status, OrderStatus::Sent);
+}
+
+#[tokio::test]
+async fn an_emergency_order_without_broker_id_is_never_duplicated_by_repricing() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    arm_breaker(&h);
+    h.engine.run_risk_check().await.expect("trip");
+    {
+        let mut s = h.store.lock().expect("lock");
+        let mut o = s
+            .orders_between(ExecMode::Live, far_past(), far_future())
+            .expect("orders")
+            .remove(0);
+        o.broker_order_id = None;
+        o.status = OrderStatus::PendingSend;
+        s.update_order(&o).expect("update");
+    }
+    h.clock.advance(Duration::minutes(20));
+    h.engine.run_risk_check().await.expect("check");
+    assert_eq!(h.fake().places().len(), 1);
+    assert!(h.fake().cancels().is_empty());
+}
+
+fn refuge_harness_with(
+    wait_seconds: u32,
+    tweak: impl FnOnce(&mut moon_app::config::AppConfig),
+) -> Harness {
+    let h = Harness::live_with(TradingMode::LiveAuto, dec!(0), |cfg| {
+        cfg.assets = vec![
+            moon_core::testutil::spec("AAA", moon_core::asset::Role::Risky),
+            moon_core::testutil::spec("BBB", moon_core::asset::Role::Risky),
+            moon_core::testutil::spec("REF", moon_core::asset::Role::Refuge),
+        ];
+        cfg.execution.emergency_fill_wait_seconds = wait_seconds;
+        tweak(cfg);
+    });
+    arm_breaker(&h);
+    h
+}
+
+#[tokio::test]
+async fn paper_emergency_buys_the_refuge_in_the_same_check() {
+    let h = Harness::paper_with(dec!(0), |cfg| {
+        cfg.assets = vec![
+            moon_core::testutil::spec("AAA", moon_core::asset::Role::Risky),
+            moon_core::testutil::spec("BBB", moon_core::asset::Role::Risky),
+            moon_core::testutil::spec("REF", moon_core::asset::Role::Refuge),
+        ];
+    });
+    h.store
+        .lock()
+        .expect("lock")
+        .save_paper_account(&moon_store::PaperAccount {
+            cash_ars: dec!(0),
+            positions: BTreeMap::from([("AAA".to_string(), dec!(100))]),
+        })
+        .expect("account");
+    set_risk_state(&h, dec!(10));
+    let out = h.engine.run_risk_check().await.expect("check");
+    assert!(out.tripped);
+    let acct = h.store.lock().expect("lock").paper_account().expect("acct");
+    assert!(!acct.positions.contains_key("AAA"), "{:?}", acct.positions);
+    assert!(
+        acct.positions.get("REF").copied().unwrap_or_default() > Decimal::ZERO,
+        "{:?}",
+        acct.positions
+    );
+}
+
+#[tokio::test]
+async fn refuge_is_bought_within_the_wait_when_sells_fill_on_refresh() {
+    let h = refuge_harness_with(5, |_| {});
+    h.fake().set_fill_on_refresh(Some(2));
+    h.engine.run_risk_check().await.expect("check");
+    let places = h.fake().places();
+    assert_eq!(places.len(), 2, "{places:?}");
+    assert_eq!(
+        (places[0].symbol.as_str(), places[0].side),
+        ("AAA", Side::Sell)
+    );
+    assert_eq!(
+        (places[1].symbol.as_str(), places[1].side),
+        ("REF", Side::Buy)
+    );
+}
+
+#[tokio::test]
+async fn refuge_waits_only_up_to_the_configured_seconds() {
+    // Sells never fill: with a 1 s wait the refuge is not bought in this check.
+    let h = refuge_harness_with(1, |_| {});
+    let started = std::time::Instant::now();
+    h.engine.run_risk_check().await.expect("check");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(h.fake().places().len(), 1, "only the sell");
+}
+
+#[tokio::test]
+async fn emergency_refuge_buy_is_exempt_from_the_daily_order_limit() {
+    let h = refuge_harness_with(0, |cfg| cfg.risk.max_orders_per_day = 1);
+    h.fake().set_fill_on_place(Some(Some(dec!(0))));
+    h.engine.run_risk_check().await.expect("check");
+    let places = h.fake().places();
+    assert_eq!(places.len(), 2, "{places:?}");
+    assert_eq!(places[1].symbol, "REF");
+}
+
+#[tokio::test]
+async fn refuge_without_quote_is_an_error_notified_once_per_hour_and_retried() {
+    let h = refuge_harness_with(0, |_| {});
+    h.fake().set_fill_on_place(Some(Some(dec!(0))));
+    h.quotes.remove("REF", Market::Bcba);
+    let notices = |h: &Harness| {
+        h.notifier
+            .messages()
+            .iter()
+            .filter(|m| m.contains("refugio") && m.contains("REF"))
+            .count()
+    };
+    h.engine.run_risk_check().await.expect("first check");
+    assert_eq!(h.fake().places().len(), 1, "only the sell");
+    assert_eq!(notices(&h), 1, "{:?}", h.notifier.messages());
+
+    h.engine.run_risk_check().await.expect("second check");
+    assert_eq!(notices(&h), 1, "deduplicated within the hour");
+
+    h.clock.advance(Duration::minutes(61));
+    h.engine.run_risk_check().await.expect("third check");
+    assert_eq!(notices(&h), 2, "notified again after an hour");
+    assert_eq!(h.fake().places().len(), 1);
+
+    // The trip is not marked as refuge done: once the quote is back the refuge is bought.
+    h.quotes
+        .set("REF", Market::Bcba, dec!(10000), Currency::Ars);
+    h.engine.run_risk_check().await.expect("fourth check");
+    let places = h.fake().places();
+    assert_eq!(places.len(), 2, "{places:?}");
+    assert_eq!(places[1].symbol, "REF");
 }

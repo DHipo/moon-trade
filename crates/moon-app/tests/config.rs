@@ -222,3 +222,28 @@ fn cash_refuge_warning_depends_on_the_cash_return() {
     cfg.backtest.config.cash_usd_return = -0.1;
     assert!(moon_app::report::cash_refuge_warning(&cfg).is_none());
 }
+
+#[test]
+fn emergency_reprice_and_wait_have_defaults_and_are_validated() {
+    let mut cfg = example();
+    assert_eq!(cfg.execution.emergency_reprice_minutes, 10);
+    assert_eq!(cfg.execution.emergency_fill_wait_seconds, 120);
+    cfg.execution.emergency_reprice_minutes = 1;
+    cfg.validate().expect("1 is the lower bound");
+    cfg.execution.emergency_reprice_minutes = 60;
+    cfg.validate().expect("60 is the upper bound");
+    cfg.execution.emergency_reprice_minutes = 0;
+    let err = cfg.validate().expect_err("zero").to_string();
+    assert!(err.contains("emergency_reprice_minutes"), "{err}");
+    cfg.execution.emergency_reprice_minutes = 61;
+    assert!(cfg.validate().is_err());
+    cfg.execution.emergency_reprice_minutes = 10;
+
+    cfg.execution.emergency_fill_wait_seconds = 0;
+    cfg.validate().expect("0 disables the wait");
+    cfg.execution.emergency_fill_wait_seconds = 600;
+    cfg.validate().expect("600 is the upper bound");
+    cfg.execution.emergency_fill_wait_seconds = 601;
+    let err = cfg.validate().expect_err("too long").to_string();
+    assert!(err.contains("emergency_fill_wait_seconds"), "{err}");
+}

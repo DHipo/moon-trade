@@ -39,6 +39,14 @@ pub struct ExecutionConfig {
     /// Emergency sells are limit orders this far below the last price (fraction, 0.03 = 3 %).
     #[serde(default = "default_emergency_limit_discount")]
     pub emergency_limit_discount: Decimal,
+    /// An emergency limit order that is still unfilled after this many minutes is cancelled and
+    /// re-sent at market (1..=60).
+    #[serde(default = "default_emergency_reprice_minutes")]
+    pub emergency_reprice_minutes: u32,
+    /// After sending emergency sells, wait up to this many seconds for them to fill so the refuge
+    /// is bought in the same risk check (0..=600).
+    #[serde(default = "default_emergency_fill_wait_seconds")]
+    pub emergency_fill_wait_seconds: u32,
     pub price_tick: Decimal,
     pub settlement_term: Term,
     pub order_type: OrderType,
@@ -50,6 +58,14 @@ pub struct ExecutionConfig {
 
 fn default_emergency_limit_discount() -> Decimal {
     Decimal::new(3, 2)
+}
+
+fn default_emergency_reprice_minutes() -> u32 {
+    10
+}
+
+fn default_emergency_fill_wait_seconds() -> u32 {
+    120
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -188,6 +204,12 @@ impl AppConfig {
             || self.execution.emergency_limit_discount > Decimal::new(2, 1)
         {
             bail!("execution.emergency_limit_discount debe estar entre 0 y 0.2");
+        }
+        if !(1..=60).contains(&self.execution.emergency_reprice_minutes) {
+            bail!("execution.emergency_reprice_minutes debe estar entre 1 y 60");
+        }
+        if self.execution.emergency_fill_wait_seconds > 600 {
+            bail!("execution.emergency_fill_wait_seconds debe estar entre 0 y 600");
         }
         if self.execution.price_tick <= Decimal::ZERO {
             bail!("execution.price_tick debe ser mayor que 0");

@@ -52,6 +52,8 @@ pub fn test_config(mode: TradingMode) -> AppConfig {
     cfg.risk.max_weight = 0.5;
     cfg.execution.poll_interval_seconds = 0;
     cfg.execution.fill_timeout_minutes = 0;
+    // Tests that exercise the emergency wait raise this explicitly.
+    cfg.execution.emergency_fill_wait_seconds = 0;
     cfg.validate().expect("test config valid");
     cfg
 }
@@ -105,6 +107,9 @@ pub struct FakeBroker {
     reject_place: Mutex<bool>,
     /// `Some(fees)`: orders fill completely at placement and the account follows.
     fill_on_place: Mutex<Option<Option<Decimal>>>,
+    /// `Some(n)`: an order fills completely on its n-th refresh and the account follows.
+    fill_on_refresh: Mutex<Option<u32>>,
+    refresh_counts: Mutex<BTreeMap<String, u32>>,
 }
 
 impl FakeBroker {
@@ -132,6 +137,8 @@ impl FakeBroker {
             fail_flows: Mutex::new(false),
             reject_place: Mutex::new(false),
             fill_on_place: Mutex::new(None),
+            fill_on_refresh: Mutex::new(None),
+            refresh_counts: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -167,6 +174,11 @@ impl FakeBroker {
 
     pub fn set_fill_on_place(&self, fees: Option<Option<Decimal>>) {
         *self.fill_on_place.lock().expect("lock") = fees;
+    }
+
+    /// Orders fill completely on their `n`-th refresh (`None`: never).
+    pub fn set_fill_on_refresh(&self, n: Option<u32>) {
+        *self.fill_on_refresh.lock().expect("lock") = n;
     }
 
     /// Sets available cash and total cash (including committed funds) separately.
@@ -257,9 +269,45 @@ impl Broker for FakeBroker {
 
     async fn refresh(
         &self,
-        _broker_order_id: &str,
+        broker_order_id: &str,
         _placed_on: NaiveDate,
     ) -> Result<OrderProgress, BrokerError> {
+        let threshold = *self.fill_on_refresh.lock().expect("lock");
+        if let Some(n) = threshold {
+            let count = {
+                let mut c = self.refresh_counts.lock().expect("lock");
+                let e = c.entry(broker_order_id.to_string()).or_insert(0);
+                *e += 1;
+                *e
+            };
+            let ticket = broker_order_id
+                .strip_prefix("fake-")
+                .and_then(|i| i.parse::<usize>().ok())
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|i| self.places.lock().expect("lock").get(i).cloned());
+            if let (true, Some(t)) = (count >= n, ticket) {
+                let price = t.limit_price.unwrap_or(dec!(10000));
+                if count == n {
+                    let value = t.qty * price;
+                    let mut a = self.account.lock().expect("lock");
+                    let held = a.positions.get(&t.symbol).copied().unwrap_or_default();
+                    let (new_held, cash) = match t.side {
+                        moon_core::types::Side::Buy => (held + t.qty, a.cash_ars - value),
+                        moon_core::types::Side::Sell => (held - t.qty, a.cash_ars + value),
+                    };
+                    a.cash_ars = cash;
+                    a.cash_total_ars = cash;
+                    a.positions.insert(t.symbol.clone(), new_held);
+                    a.sellable.insert(t.symbol.clone(), new_held);
+                }
+                return Ok(OrderProgress {
+                    status: OrderStatus::Filled,
+                    filled_qty: t.qty,
+                    avg_price: Some(price),
+                    fees: None,
+                });
+            }
+        }
         Ok(self.refresh_result.lock().expect("lock").clone())
     }
 
@@ -302,7 +350,8 @@ fn parts(
 ) {
     let mut store = Store::open_in_memory().expect("store");
     seed_series(&mut store, cfg);
-    let quotes = Arc::new(StaticQuotes::new());
+    // Quotes are stamped with the test clock so they count as fresh.
+    let quotes = Arc::new(StaticQuotes::with_stamp(clock_time()));
     seed_quotes(&quotes, cfg);
     (
         Arc::new(Mutex::new(store)),
@@ -315,7 +364,14 @@ fn parts(
 impl Harness {
     /// Paper mode with the given initial cash in the paper account.
     pub fn paper(initial_cash: Decimal) -> Harness {
-        let cfg = test_config(TradingMode::Paper);
+        Self::paper_with(initial_cash, |_| {})
+    }
+
+    /// Like [`Harness::paper`], letting the test adjust the configuration first.
+    pub fn paper_with(initial_cash: Decimal, tweak: impl FnOnce(&mut AppConfig)) -> Harness {
+        let mut cfg = test_config(TradingMode::Paper);
+        tweak(&mut cfg);
+        cfg.validate().expect("tweaked config valid");
         let (store, quotes, notifier, clock) = parts(&cfg);
         store
             .lock()

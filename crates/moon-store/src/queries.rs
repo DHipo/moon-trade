@@ -160,8 +160,7 @@ fn order_from_row(r: &Row) -> Result<OrderRecord, StoreError> {
     })
 }
 
-const SNAPSHOT_COLS: &str =
-    "at, mode, cash_ars, equity_ars, ccl, equity_usd, nav, units, drawdown, positions";
+const SNAPSHOT_COLS: &str = "at, mode, cash_ars, equity_ars, ccl, equity_usd, nav, units, drawdown, positions, cash_total_ars";
 
 fn snapshot_from_row(r: &Row) -> Result<Snapshot, StoreError> {
     Ok(Snapshot {
@@ -175,6 +174,7 @@ fn snapshot_from_row(r: &Row) -> Result<Snapshot, StoreError> {
         units: dec_decimal(&r.get::<_, String>(7)?)?,
         drawdown: r.get(8)?,
         positions: dec_json(&r.get::<_, String>(9)?)?,
+        cash_total_ars: opt_decimal(r.get(10)?)?,
     })
 }
 
@@ -416,7 +416,7 @@ impl Store {
 
     pub fn insert_snapshot(&mut self, s: &Snapshot) -> Result<(), StoreError> {
         self.conn.execute(
-            &format!("INSERT INTO snapshots ({SNAPSHOT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"),
+            &format!("INSERT INTO snapshots ({SNAPSHOT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"),
             params![
                 enc_ts(s.at),
                 s.mode.as_str(),
@@ -427,7 +427,8 @@ impl Store {
                 s.nav,
                 s.units.to_string(),
                 s.drawdown,
-                serde_json::to_string(&s.positions)?
+                serde_json::to_string(&s.positions)?,
+                s.cash_total_ars.map(|d| d.to_string())
             ],
         )?;
         Ok(())

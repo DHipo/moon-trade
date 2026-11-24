@@ -58,6 +58,7 @@ fn snapshot(cash: Decimal, qty: Decimal) -> Snapshot {
         at: ts(1),
         mode: ExecMode::Paper,
         cash_ars: cash,
+        cash_total_ars: Some(cash),
         equity_ars: dec!(1000.55),
         ccl: dec!(1200.5),
         equity_usd: dec!(0.83),
@@ -72,8 +73,8 @@ fn snapshot(cash: Decimal, qty: Decimal) -> Snapshot {
 fn migrations_are_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.db");
-    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 1);
-    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 1);
+    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 2);
+    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 2);
 }
 
 #[test]
@@ -411,4 +412,29 @@ fn apply_paper_fill_persists_account_and_state() {
     assert_eq!(s.paper_account().unwrap(), a);
     let v: Option<serde_json::Value> = s.get_state("paper_order:k").unwrap();
     assert_eq!(v, Some(serde_json::json!({"x": 1})));
+}
+
+#[test]
+fn v1_database_upgrades_in_place_and_old_snapshots_read_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.db");
+    {
+        // Build a v1 database by hand, with one snapshot row.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,              mode TEXT NOT NULL, cash_ars TEXT NOT NULL, equity_ars TEXT NOT NULL, ccl TEXT NOT NULL,              equity_usd TEXT NOT NULL, nav REAL NOT NULL, units TEXT NOT NULL, drawdown REAL NOT NULL,              positions TEXT NOT NULL);",
+        )
+        .unwrap();
+        let s = snapshot(dec!(500), dec!(2));
+        conn.execute(
+            "INSERT INTO snapshots (at, mode, cash_ars, equity_ars, ccl, equity_usd, nav, units, drawdown, positions)              VALUES (?1, 'paper', '500', '1000', '1200', '0.83', 100.0, '10', 0.0, '{}')",
+            [s.at.to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA user_version = 1").unwrap();
+    }
+    let store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 2);
+    let old = store.latest_snapshot(ExecMode::Paper).unwrap().unwrap();
+    assert_eq!(old.cash_total_ars, None);
 }

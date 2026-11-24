@@ -106,4 +106,6 @@ CREATE TABLE backtest_runs (
     metrics TEXT NOT NULL
 );
 ",
+    // Version 2: cash including committed funds, for cash reconciliation.
+    "ALTER TABLE snapshots ADD COLUMN cash_total_ars TEXT NULL;",
 ];

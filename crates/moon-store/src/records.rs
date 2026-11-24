@@ -38,6 +38,9 @@ pub struct Snapshot {
     pub at: DateTime<Utc>,
     pub mode: ExecMode,
     pub cash_ars: Decimal,
+    /// Cash including committed funds (`None` on rows written before schema v2).
+    #[serde(default)]
+    pub cash_total_ars: Option<Decimal>,
     pub equity_ars: Decimal,
     pub ccl: Decimal,
     pub equity_usd: Decimal,

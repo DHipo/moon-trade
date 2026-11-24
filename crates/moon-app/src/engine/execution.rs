@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
 use moon_broker::{OrderProgress, OrderTicket};
-use moon_core::money::{round_money, round_price};
+use moon_core::money::{floor_to_lot, round_money, round_price};
 use moon_core::rebalance::{PlannedOrder, RebalancePlan};
 use moon_core::risk::check_orders;
 use moon_core::time::art_date;
@@ -65,6 +65,8 @@ impl Engine {
         } else {
             plan.orders.clone()
         };
+        let mut errors: Vec<String> = Vec::new();
+        let first_phase = self.cap_sells(first_phase, &mut errors).await?;
         let already = self.orders_today_outside(batch_id)?;
         if let Err(violation) = check_orders(
             &first_phase,
@@ -79,7 +81,6 @@ impl Engine {
         }
 
         let mut ids: Vec<Uuid> = Vec::new();
-        let mut errors: Vec<String> = Vec::new();
         let mut halted = false;
 
         // Phase 1: sells.
@@ -88,7 +89,7 @@ impl Engine {
             .filter(|o| o.side == Side::Sell)
             .collect();
         for order in &sells {
-            let out = self.send_order(order, reason, batch_id).await?;
+            let out = self.send_order(order, reason, batch_id, emergency).await?;
             ids.push(out.id);
             if let Some(msg) = out.halt {
                 errors.push(msg);
@@ -114,7 +115,7 @@ impl Engine {
                             ));
                             continue;
                         }
-                        let out = self.send_order(order, reason, batch_id).await?;
+                        let out = self.send_order(order, reason, batch_id, emergency).await?;
                         ids.push(out.id);
                         if let Some(msg) = out.halt {
                             errors.push(msg);
@@ -143,6 +144,48 @@ impl Engine {
             .notify(&execution_summary(reason, &report))
             .await;
         Ok(report)
+    }
+
+    /// Caps every sell at the broker's sellable quantity (floored to the lot size); a sell with
+    /// nothing sellable is dropped and reported.
+    async fn cap_sells(
+        &self,
+        orders: Vec<PlannedOrder>,
+        errors: &mut Vec<String>,
+    ) -> anyhow::Result<Vec<PlannedOrder>> {
+        if !orders.iter().any(|o| o.side == Side::Sell) {
+            return Ok(orders);
+        }
+        let account = self.deps.broker.account().await?;
+        let mut out = Vec::with_capacity(orders.len());
+        for mut o in orders {
+            if o.side == Side::Sell {
+                let Some(exec) = self.universe.get(&o.asset).and_then(|a| a.exec.as_ref()) else {
+                    out.push(o);
+                    continue;
+                };
+                let sellable = account
+                    .sellable
+                    .get(&exec.symbol)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
+                if o.qty > sellable {
+                    let capped = floor_to_lot(sellable, exec.lot_size);
+                    if capped <= Decimal::ZERO {
+                        errors.push(format!(
+                            "Venta de {} omitida: no hay cantidad vendible (disponible {sellable}).",
+                            exec.symbol
+                        ));
+                        continue;
+                    }
+                    o.qty = capped;
+                    o.est_value = round_money(capped * o.exec_price);
+                    o.est_fees = self.cfg.fees.total(o.est_value);
+                }
+            }
+            out.push(o);
+        }
+        Ok(out)
     }
 
     /// Fresh valuation and plan; returns only the buys, plus the real cash they can use.
@@ -181,6 +224,7 @@ impl Engine {
         order: &PlannedOrder,
         reason: OrderReason,
         batch_id: Uuid,
+        emergency: bool,
     ) -> anyhow::Result<SendOutcome> {
         let exec = self
             .universe
@@ -191,7 +235,13 @@ impl Engine {
         let now = self.now();
         let tolerance = self.cfg.execution.limit_tolerance;
         let tick = self.cfg.execution.price_tick;
-        let limit_price = match self.cfg.execution.order_type {
+        // Emergency sells go at market: the priority is getting out in a falling market.
+        let order_type = if emergency {
+            OrderType::Market
+        } else {
+            self.cfg.execution.order_type
+        };
+        let limit_price = match order_type {
             OrderType::Market => None,
             OrderType::Limit => Some(match order.side {
                 Side::Buy => ceil_to_tick(order.ref_price * (Decimal::ONE + tolerance), tick),
@@ -249,7 +299,7 @@ impl Engine {
             market: exec.market,
             side: order.side,
             qty: order.qty,
-            order_type: self.cfg.execution.order_type,
+            order_type,
             limit_price,
             due_date: art_date(now),
             settlement_term: self.cfg.execution.settlement_term,

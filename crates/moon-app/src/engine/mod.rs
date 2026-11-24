@@ -40,6 +40,12 @@ pub const STATE_DRAWDOWN: &str = "drawdown";
 pub const STATE_TELEGRAM_OFFSET: &str = "telegram_offset";
 pub const STATE_SCHEDULE: &str = "schedule";
 /// Set once the paper account has been seeded with the configured initial cash.
+/// Last day (ART) up to which external flows were queried.
+pub const STATE_FLOWS_CHECKED: &str = "flows_checked_until";
+/// Trip date for which the refuge buy after an emergency exit was already attempted.
+pub const STATE_EMERGENCY_REFUGE: &str = "emergency_refuge_done";
+/// Per asset, the last day the user was warned about an emergency order with unknown outcome.
+pub const STATE_EMERGENCY_UNKNOWN: &str = "emergency_unknown_notified";
 pub const STATE_PAPER_INIT: &str = "paper_initialized";
 
 /// Prefix of the error recorded when `place` failed and the order may exist at the broker.
@@ -253,6 +259,13 @@ impl Engine {
                 Ok(d)
             }
         }
+    }
+
+    /// NAV of `tracker` at `equity_usd`; an empty tracker is an explicit error, never a guess.
+    pub(crate) fn nav_of(tracker: &NavTracker, equity_usd: Decimal) -> anyhow::Result<f64> {
+        tracker.nav(equity_usd).ok_or_else(|| {
+            anyhow!("no se puede calcular el NAV: no hay unidades (patrimonio en cero)")
+        })
     }
 
     pub(crate) fn holidays(&self) -> &[NaiveDate] {

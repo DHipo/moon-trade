@@ -76,8 +76,9 @@ pub fn seed_series(store: &mut Store, cfg: &AppConfig) {
 
 /// Exec symbols at 10,000 ARS; FX pairs consistent with a CCL of exactly 1200.
 pub fn seed_quotes(quotes: &StaticQuotes, cfg: &AppConfig) {
-    for sym in ["AAA", "BBB"] {
-        quotes.set(sym, Market::Bcba, dec!(10000), Currency::Ars);
+    for asset in cfg.universe().expect("universe").tradable() {
+        let exec = asset.exec.as_ref().expect("exec");
+        quotes.set(&exec.symbol, Market::Bcba, dec!(10000), Currency::Ars);
     }
     for p in &cfg.fx.pairs {
         quotes.set(&p.adr_symbol, p.adr_market, dec!(10), Currency::Usd);
@@ -98,6 +99,9 @@ pub struct FakeBroker {
     refresh_result: Mutex<OrderProgress>,
     flows: Mutex<Vec<ExternalFlow>>,
     fail_place: Mutex<bool>,
+    reject_place: Mutex<bool>,
+    /// `Some(fees)`: orders fill completely at placement and the account follows.
+    fill_on_place: Mutex<Option<Option<Decimal>>>,
 }
 
 impl FakeBroker {
@@ -119,6 +123,8 @@ impl FakeBroker {
             }),
             flows: Mutex::new(Vec::new()),
             fail_place: Mutex::new(false),
+            reject_place: Mutex::new(false),
+            fill_on_place: Mutex::new(None),
         }
     }
 
@@ -134,6 +140,22 @@ impl FakeBroker {
 
     pub fn set_fail_place(&self, fail: bool) {
         *self.fail_place.lock().expect("lock") = fail;
+    }
+
+    pub fn set_reject_place(&self, reject: bool) {
+        *self.reject_place.lock().expect("lock") = reject;
+    }
+
+    pub fn set_fill_on_place(&self, fees: Option<Option<Decimal>>) {
+        *self.fill_on_place.lock().expect("lock") = fees;
+    }
+
+    pub fn set_sellable(&self, symbol: &str, qty: Decimal) {
+        self.account
+            .lock()
+            .expect("lock")
+            .sellable
+            .insert(symbol.to_string(), qty);
     }
 
     pub fn places(&self) -> Vec<OrderTicket> {
@@ -159,13 +181,41 @@ impl Broker for FakeBroker {
         if *self.fail_place.lock().expect("lock") {
             return Err(BrokerError::Broker("timeout de red".into()));
         }
+        if *self.reject_place.lock().expect("lock") {
+            return Ok(PlaceResult {
+                broker_order_id: "rejected".into(),
+                accepted: false,
+                messages: vec!["rechazada por el mercado".into()],
+                fill: None,
+            });
+        }
         let mut p = self.places.lock().expect("lock");
         p.push(ticket.clone());
+        let mut fill = None;
+        if let Some(fees) = *self.fill_on_place.lock().expect("lock") {
+            let price = ticket.limit_price.unwrap_or(dec!(10000));
+            let value = ticket.qty * price;
+            let mut a = self.account.lock().expect("lock");
+            let held = a.positions.get(&ticket.symbol).copied().unwrap_or_default();
+            let (new_held, cash) = match ticket.side {
+                moon_core::types::Side::Buy => (held + ticket.qty, a.cash_ars - value),
+                moon_core::types::Side::Sell => (held - ticket.qty, a.cash_ars + value),
+            };
+            a.cash_ars = cash;
+            a.positions.insert(ticket.symbol.clone(), new_held);
+            a.sellable.insert(ticket.symbol.clone(), new_held);
+            fill = Some(OrderProgress {
+                status: OrderStatus::Filled,
+                filled_qty: ticket.qty,
+                avg_price: Some(price),
+                fees,
+            });
+        }
         Ok(PlaceResult {
             broker_order_id: format!("fake-{}", p.len()),
             accepted: true,
             messages: vec![],
-            fill: None,
+            fill,
         })
     }
 
@@ -266,7 +316,18 @@ impl Harness {
 
     /// Live mode (opted in) on top of a [`FakeBroker`] with the given cash.
     pub fn live(mode: TradingMode, cash_ars: Decimal) -> Harness {
-        let cfg = test_config(mode);
+        Self::live_with(mode, cash_ars, |_| {})
+    }
+
+    /// Like [`Harness::live`], letting the test adjust the configuration first.
+    pub fn live_with(
+        mode: TradingMode,
+        cash_ars: Decimal,
+        tweak: impl FnOnce(&mut AppConfig),
+    ) -> Harness {
+        let mut cfg = test_config(mode);
+        tweak(&mut cfg);
+        cfg.validate().expect("tweaked config valid");
         let (store, quotes, notifier, clock) = parts(&cfg);
         let fake = Arc::new(FakeBroker::new(cash_ars));
         let engine = Engine::new(

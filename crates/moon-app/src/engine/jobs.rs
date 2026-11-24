@@ -1,19 +1,22 @@
 //! Scheduled and interactive jobs: monthly rebalance, approvals, risk check, daily close and the
 //! paper account commands. Every job takes the trading lock, so they never interleave.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::bail;
+use anyhow::{anyhow, bail};
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use moon_broker::ExternalFlow;
+use moon_core::asset::AssetId;
 use moon_core::money::round_money;
 use moon_core::nav::NavTracker;
+use moon_core::rebalance::{PlannedOrder, RebalancePlan};
 use moon_core::risk::{DrawdownSignal, DrawdownState};
 use moon_core::time::{ART, art_datetime};
 use moon_core::types::{DataSource, ExecMode, OrderReason, OrderStatus};
 use moon_core::weights::TargetWeights;
 use moon_store::{
-    FlowKind, FlowRecord, PaperAccount, Proposal, ProposalKind, ProposalStatus, Snapshot,
+    FlowKind, FlowRecord, OrderRecord, PaperAccount, Proposal, ProposalKind, ProposalStatus,
+    Snapshot,
 };
 use moon_yahoo::YahooClient;
 use rust_decimal::Decimal;
@@ -23,8 +26,9 @@ use uuid::Uuid;
 use super::reconcile::reconcile_positions;
 use super::text::{execution_summary, proposal_text};
 use super::{
-    Engine, MonthlyOutcome, RiskOutcome, STATE_DRAWDOWN, STATE_NAV, STATE_PAPER_INIT,
-    UNKNOWN_OUTCOME, art_day_bounds, previous_trading_day,
+    Engine, ExecutionReport, MonthlyOutcome, PositionValue, RiskOutcome, STATE_DRAWDOWN,
+    STATE_EMERGENCY_REFUGE, STATE_EMERGENCY_UNKNOWN, STATE_FLOWS_CHECKED, STATE_NAV,
+    STATE_PAPER_INIT, UNKNOWN_OUTCOME, Valuation, art_day_bounds, previous_trading_day,
 };
 use crate::config::TradingMode;
 
@@ -56,10 +60,14 @@ impl Engine {
         let v = self.valuation().await?;
         // A monthly decision re-arms the drawdown breaker at the current NAV.
         let tracker = self.load_tracker(v.equity_usd)?;
-        let nav = tracker.nav(v.equity_usd).unwrap_or(1.0);
+        let nav = Self::nav_of(&tracker, v.equity_usd)?;
         let mut drawdown = self.load_drawdown(nav)?;
         drawdown.reset(nav);
-        self.db(|s| s.set_state(STATE_DRAWDOWN, &drawdown))?;
+        self.db(|s| {
+            s.set_state(STATE_DRAWDOWN, &drawdown)?;
+            s.delete_state(STATE_EMERGENCY_REFUGE)?;
+            s.delete_state(STATE_EMERGENCY_UNKNOWN)
+        })?;
 
         let targets = decision.final_weights.clone();
         let plan = self.plan(&targets, &v, false)?;
@@ -221,13 +229,19 @@ impl Engine {
 
     // --- risk check ---
 
-    /// Drawdown breaker. Emergency exits run in every mode and even when paused.
+    /// Drawdown breaker. Emergency exits run in every mode and even when paused. While the
+    /// breaker is tripped every check retries what is still held, so a rejected or cancelled
+    /// emergency sell is never left behind.
     pub async fn run_risk_check(&self) -> anyhow::Result<RiskOutcome> {
         let _guard = self.trading_lock.lock().await;
-        let v = self.valuation().await?;
+        let v = self.valuation().await.map_err(|e| {
+            anyhow!("No se pudo valuar la cartera: el control de caída no corrió ({e})")
+        })?;
         let today = self.today();
+        // Flows first: a withdrawal must not look like a drawdown.
+        self.process_flows(&v).await?;
         let tracker = self.load_tracker(v.equity_usd)?;
-        let nav = tracker.nav(v.equity_usd).unwrap_or(1.0);
+        let nav = Self::nav_of(&tracker, v.equity_usd)?;
         let mut drawdown = self.load_drawdown(nav)?;
         let signal = drawdown.observe(nav, today, self.cfg.risk.max_drawdown);
         self.db(|s| {
@@ -241,28 +255,143 @@ impl Engine {
             tripped: signal == DrawdownSignal::Tripped,
             emergency: None,
         };
-        if signal != DrawdownSignal::Tripped {
+        if !drawdown.tripped {
             return Ok(outcome);
         }
 
-        let header = format!(
-            "🚨 Freno por caída: el patrimonio cayó {:.1}% desde su máximo (límite {:.1}%). \
-             Se venden las posiciones de riesgo y se bloquea la operación hasta la próxima decisión mensual.",
-            dd * 100.0,
-            self.cfg.risk.max_drawdown * 100.0
-        );
-        let targets = TargetWeights::all_in(self.universe.refuge().id.clone());
-        let plan = self.plan(&targets, &v, true)?;
-        if plan.sells().is_empty() {
+        let header = (signal == DrawdownSignal::Tripped).then(|| {
+            format!(
+                "🚨 Freno por caída: el patrimonio cayó {:.1}% desde su máximo (límite {:.1}%). \
+                 Se venden las posiciones de riesgo y se bloquea la operación hasta la próxima decisión mensual.",
+                dd * 100.0,
+                self.cfg.risk.max_drawdown * 100.0
+            )
+        });
+        outcome.emergency = self
+            .emergency_sweep(&v, &drawdown, header.as_deref())
+            .await?;
+        if let Err(e) = self.emergency_refuge_buy(&drawdown).await {
+            tracing::error!("compra del refugio tras la salida de emergencia: {e}");
             self.deps
                 .notifier
                 .notify(&format!(
-                    "{header}\nNo hay posiciones de riesgo para vender."
+                    "⚠️ No se pudo completar la compra del refugio tras el freno por caída: {e}"
                 ))
                 .await;
-            return Ok(outcome);
         }
-        self.deps.notifier.notify(&header).await;
+        Ok(outcome)
+    }
+
+    /// Sells what is still held in risky assets, once per asset unless an order is already
+    /// working or its outcome is unknown.
+    async fn emergency_sweep(
+        &self,
+        v: &Valuation,
+        drawdown: &DrawdownState,
+        header: Option<&str>,
+    ) -> anyhow::Result<Option<ExecutionReport>> {
+        let today = self.today();
+        let mode = self.exec_mode();
+        let refuge = self.universe.refuge().id.clone();
+        let since = art_day_bounds(drawdown.tripped_on.unwrap_or(today)).0;
+        let until = self.now() + Duration::days(1);
+        let emergency_orders: Vec<OrderRecord> = self
+            .db(|s| s.orders_between(mode, since, until))?
+            .into_iter()
+            .filter(|o| o.reason == OrderReason::Emergency)
+            .collect();
+
+        let held: Vec<&PositionValue> = v
+            .positions
+            .iter()
+            .filter(|p| p.asset != refuge && p.qty > Decimal::ZERO)
+            .collect();
+        if let Some(h) = header {
+            let tail = if held.is_empty() {
+                "\nNo hay posiciones de riesgo para vender."
+            } else {
+                ""
+            };
+            self.deps.notifier.notify(&format!("{h}{tail}")).await;
+        }
+
+        let mut candidates: BTreeSet<AssetId> = BTreeSet::new();
+        let mut unknown: Vec<String> = Vec::new();
+        for p in held {
+            let mine: Vec<&OrderRecord> = emergency_orders
+                .iter()
+                .filter(|o| o.asset == p.asset)
+                .collect();
+            if mine.iter().any(|o| !o.status.is_terminal()) {
+                continue; // still working: leave it
+            }
+            let is_unknown = |o: &&OrderRecord| {
+                o.status == OrderStatus::Failed
+                    && o.error
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with(UNKNOWN_OUTCOME))
+            };
+            if mine.iter().any(is_unknown) {
+                unknown.push(p.symbol.clone());
+                continue; // never re-send an order whose outcome is unknown
+            }
+            candidates.insert(p.asset.clone());
+        }
+
+        if !unknown.is_empty() {
+            let mut notified: BTreeMap<String, NaiveDate> = self
+                .db(|s| s.get_state(STATE_EMERGENCY_UNKNOWN))?
+                .unwrap_or_default();
+            let mut fresh = Vec::new();
+            for sym in unknown {
+                if notified.get(&sym) != Some(&today) {
+                    notified.insert(sym.clone(), today);
+                    fresh.push(sym);
+                }
+            }
+            if !fresh.is_empty() {
+                self.db(|s| s.set_state(STATE_EMERGENCY_UNKNOWN, &notified))?;
+                self.deps
+                    .notifier
+                    .notify(&format!(
+                        "🚨 Freno por caída: la venta de emergencia de {} tiene resultado desconocido y NO se reenvía. \
+                         Verificá en IOL si la orden existe y vendé a mano si hace falta.",
+                        fresh.join(", ")
+                    ))
+                    .await;
+            }
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        let targets = TargetWeights::all_in(refuge);
+        let full = self.plan(&targets, v, true)?;
+        let orders: Vec<PlannedOrder> = full
+            .sells()
+            .into_iter()
+            .filter(|o| candidates.contains(&o.asset))
+            .cloned()
+            .collect();
+        if orders.is_empty() {
+            return Ok(None);
+        }
+        if header.is_none() {
+            let names: Vec<String> = orders.iter().map(|o| o.asset.to_string()).collect();
+            self.deps
+                .notifier
+                .notify(&format!(
+                    "🚨 Freno por caída activo: se reintenta la venta de emergencia de {}.",
+                    names.join(", ")
+                ))
+                .await;
+        }
+        let plan = RebalancePlan {
+            equity: full.equity,
+            orders,
+            skipped: full.skipped,
+            est_cash_after: full.est_cash_after,
+        };
         let report = self
             .execute(
                 &plan,
@@ -272,8 +401,121 @@ impl Engine {
                 true,
             )
             .await?;
-        outcome.emergency = Some(report);
-        Ok(outcome)
+        Ok(Some(report))
+    }
+
+    /// With a non-CASH refuge: once nothing risky is held and no emergency order is working,
+    /// buys the refuge once per trip, within the normal order limits.
+    async fn emergency_refuge_buy(&self, drawdown: &DrawdownState) -> anyhow::Result<()> {
+        let refuge = self.universe.refuge().id.clone();
+        if refuge.is_cash() {
+            return Ok(());
+        }
+        let marker = drawdown.tripped_on.unwrap_or_else(|| self.today());
+        if self.db(|s| s.get_state::<NaiveDate>(STATE_EMERGENCY_REFUGE))? == Some(marker) {
+            return Ok(());
+        }
+        let v = self.valuation().await?;
+        if v.positions
+            .iter()
+            .any(|p| p.asset != refuge && p.qty > Decimal::ZERO)
+        {
+            return Ok(());
+        }
+        let mode = self.exec_mode();
+        let working = self
+            .db(|s| s.open_orders(mode))?
+            .iter()
+            .any(|o| o.reason == OrderReason::Emergency);
+        if working {
+            return Ok(());
+        }
+        self.db(|s| s.set_state(STATE_EMERGENCY_REFUGE, &marker))?;
+        let targets = TargetWeights::all_in(refuge.clone());
+        let full = self.plan(&targets, &v, true)?;
+        let orders: Vec<PlannedOrder> = full
+            .buys()
+            .into_iter()
+            .filter(|o| o.asset == refuge)
+            .cloned()
+            .collect();
+        if orders.is_empty() {
+            return Ok(());
+        }
+        let plan = RebalancePlan {
+            equity: full.equity,
+            orders,
+            skipped: full.skipped,
+            est_cash_after: full.est_cash_after,
+        };
+        // Normal (non-emergency) limits apply; if they block the buy, `execute` notifies.
+        self.execute(
+            &plan,
+            &targets,
+            OrderReason::Emergency,
+            Uuid::new_v4(),
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Detects deposits and withdrawals since the last check and applies them to the NAV
+    /// tracker. Deduplicated by external id.
+    async fn process_flows(&self, v: &Valuation) -> anyhow::Result<()> {
+        let today = self.today();
+        let mode = self.exec_mode();
+        let from = self
+            .db(|s| s.get_state::<NaiveDate>(STATE_FLOWS_CHECKED))?
+            .unwrap_or(today - Duration::days(7))
+            .min(today);
+        let flows = self.deps.broker.external_flows(from, today).await?;
+        let mut fresh: Vec<(ExternalFlow, Decimal)> = Vec::new();
+        for f in flows {
+            let record = FlowRecord {
+                at: f.at,
+                mode,
+                kind: f.kind,
+                amount_ars: f.amount_ars,
+                external_id: Some(f.external_id.clone()),
+                note: "detectado automáticamente".to_string(),
+            };
+            if self.db(|s| s.insert_flow(&record))? {
+                let usd = round_money(f.amount_ars.abs() / v.ccl);
+                let signed = if f.kind == FlowKind::Withdrawal {
+                    -usd
+                } else {
+                    usd
+                };
+                fresh.push((f, signed));
+            }
+        }
+        if !fresh.is_empty() {
+            let total: Decimal = fresh.iter().map(|(_, s)| *s).sum();
+            let mut equity_before = v.equity_usd - total;
+            let mut tracker = match self.db(|s| s.get_state::<NavTracker>(STATE_NAV))? {
+                Some(t) => t,
+                None => NavTracker::start(equity_before),
+            };
+            for (f, signed) in &fresh {
+                tracker.apply_flow(*signed, equity_before);
+                equity_before += *signed;
+                let (icon, word) = if f.kind == FlowKind::Withdrawal {
+                    ("💸", "Extracción")
+                } else {
+                    ("💰", "Depósito")
+                };
+                let text = format!(
+                    "{icon} {word} detectado: ARS {} (≈ USD {}). El NAV no cambia.",
+                    f.amount_ars.abs().round_dp(2),
+                    signed.abs()
+                );
+                self.deps.notifier.notify(&text).await;
+            }
+            self.db(|s| s.set_state(STATE_NAV, &tracker))?;
+        }
+        self.db(|s| s.set_state(STATE_FLOWS_CHECKED, &today))?;
+        Ok(())
     }
 
     // --- daily close ---
@@ -304,54 +546,7 @@ impl Engine {
         let v = self.valuation().await?;
 
         // 3. External deposits and withdrawals.
-        let flows = self.deps.broker.external_flows(today, today).await?;
-        let mut fresh: Vec<(ExternalFlow, Decimal)> = Vec::new();
-        for f in flows {
-            let record = FlowRecord {
-                at: f.at,
-                mode,
-                kind: f.kind,
-                amount_ars: f.amount_ars,
-                external_id: Some(f.external_id.clone()),
-                note: "detectado en el cierre diario".to_string(),
-            };
-            if self.db(|s| s.insert_flow(&record))? {
-                let usd = round_money(f.amount_ars.abs() / v.ccl);
-                let signed = if f.kind == FlowKind::Withdrawal {
-                    -usd
-                } else {
-                    usd
-                };
-                fresh.push((f, signed));
-            }
-        }
-        if !fresh.is_empty() {
-            let total: Decimal = fresh.iter().map(|(_, s)| *s).sum();
-            let mut equity_before = v.equity_usd - total;
-            let mut tracker = match self.db(|s| s.get_state::<NavTracker>(STATE_NAV))? {
-                Some(t) => t,
-                None => NavTracker::start(equity_before),
-            };
-            for (f, signed) in &fresh {
-                tracker.apply_flow(*signed, equity_before);
-                equity_before += *signed;
-                let text = if f.kind == FlowKind::Withdrawal {
-                    format!(
-                        "💸 Extracción detectada: ARS {} (≈ USD {}). El NAV no cambia.",
-                        f.amount_ars.abs().round_dp(2),
-                        signed.abs()
-                    )
-                } else {
-                    format!(
-                        "💰 Depósito detectado: ARS {} (≈ USD {}). El NAV no cambia.",
-                        f.amount_ars.abs().round_dp(2),
-                        signed.abs()
-                    )
-                };
-                self.deps.notifier.notify(&text).await;
-            }
-            self.db(|s| s.set_state(STATE_NAV, &tracker))?;
-        }
+        self.process_flows(&v).await?;
 
         // 4. Reconcile positions against the last snapshot before today plus today's fills.
         let current: BTreeMap<String, Decimal> = v
@@ -378,7 +573,7 @@ impl Engine {
 
         // 7. Snapshot.
         let tracker = self.load_tracker(v.equity_usd)?;
-        let nav = tracker.nav(v.equity_usd).unwrap_or(1.0);
+        let nav = Self::nav_of(&tracker, v.equity_usd)?;
         let drawdown = self.load_drawdown(nav)?;
         let snapshot = Snapshot {
             at: now,

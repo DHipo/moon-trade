@@ -42,6 +42,8 @@ pub const STATE_SCHEDULE: &str = "schedule";
 /// Set once the paper account has been seeded with the configured initial cash.
 /// Last day (ART) up to which external flows were queried.
 pub const STATE_FLOWS_CHECKED: &str = "flows_checked_until";
+/// When the user was last warned that deposits/withdrawals could not be queried.
+pub const STATE_FLOWS_WARNED: &str = "flows_query_warned_at";
 /// Trip date for which the refuge buy after an emergency exit was already attempted.
 pub const STATE_EMERGENCY_REFUGE: &str = "emergency_refuge_done";
 /// Per asset, the last day the user was warned about an emergency order with unknown outcome.

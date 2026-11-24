@@ -785,3 +785,48 @@ async fn oversize_order_is_blocked_after_usd_to_ars_conversion() {
             .any(|m| m.contains("bloqueada"))
     );
 }
+
+// --- fix round 2 ---
+
+#[tokio::test]
+async fn emergency_sell_survives_flow_query_failure() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    arm_breaker(&h);
+    h.fake().set_fail_flows(true);
+    let out = h.engine.run_risk_check().await.expect("check");
+    assert!(out.tripped);
+    assert_eq!(h.fake().places().len(), 1);
+    h.engine.run_risk_check().await.expect("second check");
+    let warned = h
+        .notifier
+        .messages()
+        .into_iter()
+        .filter(|m| m.contains("No se pudieron consultar depósitos/extracciones"))
+        .count();
+    assert_eq!(warned, 1, "warned at most once per hour");
+}
+
+#[tokio::test]
+async fn refuge_buy_is_retried_after_a_broker_error() {
+    let h = Harness::live_with(TradingMode::LiveAuto, dec!(0), |cfg| {
+        cfg.assets = vec![
+            moon_core::testutil::spec("AAA", moon_core::asset::Role::Risky),
+            moon_core::testutil::spec("BBB", moon_core::asset::Role::Risky),
+            moon_core::testutil::spec("REF", moon_core::asset::Role::Refuge),
+        ];
+    });
+    arm_breaker(&h);
+    h.fake().set_fill_on_place(Some(Some(dec!(0))));
+    h.fake().set_fail_buys(true);
+    h.engine.run_risk_check().await.expect("first check");
+    assert_eq!(h.fake().places().len(), 1, "only the sell went through");
+
+    h.fake().set_fail_buys(false);
+    h.engine.run_risk_check().await.expect("second check");
+    let places = h.fake().places();
+    assert_eq!(places.len(), 2, "{places:?}");
+    assert_eq!(places[1].symbol, "REF");
+
+    h.engine.run_risk_check().await.expect("third check");
+    assert_eq!(h.fake().places().len(), 2);
+}

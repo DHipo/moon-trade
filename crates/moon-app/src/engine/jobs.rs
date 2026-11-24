@@ -27,8 +27,8 @@ use super::reconcile::reconcile_positions;
 use super::text::{execution_summary, proposal_text};
 use super::{
     Engine, ExecutionReport, MonthlyOutcome, PositionValue, RiskOutcome, STATE_DRAWDOWN,
-    STATE_EMERGENCY_REFUGE, STATE_EMERGENCY_UNKNOWN, STATE_FLOWS_CHECKED, STATE_NAV,
-    STATE_PAPER_INIT, UNKNOWN_OUTCOME, Valuation, art_day_bounds, previous_trading_day,
+    STATE_EMERGENCY_REFUGE, STATE_EMERGENCY_UNKNOWN, STATE_FLOWS_CHECKED, STATE_FLOWS_WARNED,
+    STATE_NAV, STATE_PAPER_INIT, UNKNOWN_OUTCOME, Valuation, art_day_bounds, previous_trading_day,
 };
 use crate::config::TradingMode;
 
@@ -239,7 +239,10 @@ impl Engine {
         })?;
         let today = self.today();
         // Flows first: a withdrawal must not look like a drawdown.
-        self.process_flows(&v).await?;
+        if let Err(e) = self.process_flows(&v).await {
+            tracing::warn!("no se pudieron consultar depósitos/extracciones: {e}");
+            self.warn_flows_unavailable(&e).await;
+        }
         let tracker = self.load_tracker(v.equity_usd)?;
         let nav = Self::nav_of(&tracker, v.equity_usd)?;
         let mut drawdown = self.load_drawdown(nav)?;
@@ -430,7 +433,6 @@ impl Engine {
         if working {
             return Ok(());
         }
-        self.db(|s| s.set_state(STATE_EMERGENCY_REFUGE, &marker))?;
         let targets = TargetWeights::all_in(refuge.clone());
         let full = self.plan(&targets, &v, true)?;
         let orders: Vec<PlannedOrder> = full
@@ -440,7 +442,8 @@ impl Engine {
             .cloned()
             .collect();
         if orders.is_empty() {
-            return Ok(());
+            // Nothing to buy (already invested or no cash): done for this trip.
+            return self.db(|s| s.set_state(STATE_EMERGENCY_REFUGE, &marker));
         }
         let plan = RebalancePlan {
             equity: full.equity,
@@ -449,15 +452,49 @@ impl Engine {
             est_cash_after: full.est_cash_after,
         };
         // Normal (non-emergency) limits apply; if they block the buy, `execute` notifies.
-        self.execute(
-            &plan,
-            &targets,
-            OrderReason::Emergency,
-            Uuid::new_v4(),
-            false,
-        )
-        .await?;
+        let result = self
+            .execute(
+                &plan,
+                &targets,
+                OrderReason::Emergency,
+                Uuid::new_v4(),
+                false,
+            )
+            .await;
+        match result {
+            // A broker error leaves the marker unset so the next check tries again.
+            Ok(report) if report.errors.is_empty() => {
+                self.db(|s| s.set_state(STATE_EMERGENCY_REFUGE, &marker))?;
+            }
+            Ok(_) => {}
+            // Blocked by the order limits: already notified, retrying would not help.
+            Err(e) if e.to_string().starts_with("Orden bloqueada") => {
+                self.db(|s| s.set_state(STATE_EMERGENCY_REFUGE, &marker))?;
+            }
+            Err(e) => return Err(e),
+        }
         Ok(())
+    }
+
+    /// Warns (at most once per hour) that flows could not be queried.
+    async fn warn_flows_unavailable(&self, err: &anyhow::Error) {
+        let now = self.now();
+        let last = self
+            .db(|s| s.get_state::<DateTime<Utc>>(STATE_FLOWS_WARNED))
+            .ok()
+            .flatten();
+        if last.is_some_and(|t| now - t < Duration::hours(1)) {
+            return;
+        }
+        if self.db(|s| s.set_state(STATE_FLOWS_WARNED, &now)).is_err() {
+            tracing::warn!("no se pudo guardar el aviso de flujos");
+        }
+        self.deps
+            .notifier
+            .notify(&format!(
+                "⚠️ No se pudieron consultar depósitos/extracciones ({err}); el control de caída sigue con el NAV actual."
+            ))
+            .await;
     }
 
     /// Detects deposits and withdrawals since the last check and applies them to the NAV

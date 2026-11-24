@@ -73,8 +73,8 @@ fn snapshot(cash: Decimal, qty: Decimal) -> Snapshot {
 fn migrations_are_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("t.db");
-    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 2);
-    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 2);
+    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 3);
+    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 3);
 }
 
 #[test]
@@ -303,13 +303,64 @@ fn fx_and_decisions() {
     s.insert_fx(&a).unwrap();
     assert_eq!(s.latest_fx().unwrap().unwrap(), b);
 
-    let id1 = s.log_decision(ts(1), "k", &serde_json::json!(1)).unwrap();
-    let id2 = s.log_decision(ts(2), "k", &serde_json::json!(2)).unwrap();
+    let m = ExecMode::Paper;
+    let id1 = s
+        .log_decision(ts(1), "k", m, &serde_json::json!(1))
+        .unwrap();
+    let id2 = s
+        .log_decision(ts(2), "k", m, &serde_json::json!(2))
+        .unwrap();
     assert!(id2 > id1);
-    let rec = s.recent_decisions(1).unwrap();
+    let rec = s.recent_decisions(1, m).unwrap();
     assert_eq!(rec.len(), 1);
     assert_eq!(rec[0].id, id2);
-    assert_eq!(s.recent_decisions(10).unwrap().len(), 2);
+    assert_eq!(s.recent_decisions(10, m).unwrap().len(), 2);
+}
+
+#[test]
+fn decisions_are_separated_by_mode() {
+    let mut s = Store::open_in_memory().unwrap();
+    let p = s
+        .log_decision(ts(1), "monthly", ExecMode::Paper, &serde_json::json!("p"))
+        .unwrap();
+    let l = s
+        .log_decision(ts(2), "monthly", ExecMode::Live, &serde_json::json!("l"))
+        .unwrap();
+    let paper = s.recent_decisions(10, ExecMode::Paper).unwrap();
+    assert_eq!(paper.iter().map(|d| d.id).collect::<Vec<_>>(), vec![p]);
+    let live = s.recent_decisions(10, ExecMode::Live).unwrap();
+    assert_eq!(live.iter().map(|d| d.id).collect::<Vec<_>>(), vec![l]);
+}
+
+#[test]
+fn v2_database_upgrades_and_old_decisions_count_as_paper() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v2.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL);
+             INSERT INTO decisions (at, kind, payload) VALUES ('2025-01-01T12:00:00+00:00', 'monthly', '{}');
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    }
+    let mut store = Store::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 3);
+    assert_eq!(
+        store.recent_decisions(10, ExecMode::Paper).unwrap().len(),
+        1
+    );
+    assert!(
+        store
+            .recent_decisions(10, ExecMode::Live)
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .log_decision(ts(3), "monthly", ExecMode::Live, &serde_json::json!({}))
+        .unwrap();
+    assert_eq!(store.recent_decisions(10, ExecMode::Live).unwrap().len(), 1);
 }
 
 #[test]
@@ -422,7 +473,7 @@ fn v1_database_upgrades_in_place_and_old_snapshots_read_back() {
         // Build a v1 database by hand, with one snapshot row.
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
-            "CREATE TABLE snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,              mode TEXT NOT NULL, cash_ars TEXT NOT NULL, equity_ars TEXT NOT NULL, ccl TEXT NOT NULL,              equity_usd TEXT NOT NULL, nav REAL NOT NULL, units TEXT NOT NULL, drawdown REAL NOT NULL,              positions TEXT NOT NULL);",
+            "CREATE TABLE snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,              mode TEXT NOT NULL, cash_ars TEXT NOT NULL, equity_ars TEXT NOT NULL, ccl TEXT NOT NULL,              equity_usd TEXT NOT NULL, nav REAL NOT NULL, units TEXT NOT NULL, drawdown REAL NOT NULL,              positions TEXT NOT NULL); CREATE TABLE decisions (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL);",
         )
         .unwrap();
         let s = snapshot(dec!(500), dec!(2));
@@ -434,7 +485,7 @@ fn v1_database_upgrades_in_place_and_old_snapshots_read_back() {
         conn.execute_batch("PRAGMA user_version = 1").unwrap();
     }
     let store = Store::open(&path).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(store.schema_version().unwrap(), 3);
     let old = store.latest_snapshot(ExecMode::Paper).unwrap().unwrap();
     assert_eq!(old.cash_total_ars, None);
 }

@@ -71,6 +71,7 @@ impl Engine {
             s.log_decision(
                 now,
                 "monthly",
+                self.exec_mode(),
                 &json!({"as_of": as_of, "decision": &decision}),
             )
         })?;
@@ -920,9 +921,10 @@ impl Engine {
             .is_some_and(|d| d.tripped))
     }
 
-    /// Target weights of the latest monthly decision, if there is one.
+    /// Target weights of the latest monthly decision of the current mode, if there is one.
     fn last_monthly_targets(&self) -> anyhow::Result<Option<TargetWeights>> {
-        let decisions = self.db(|s| s.recent_decisions(50))?;
+        let mode = self.exec_mode();
+        let decisions = self.db(|s| s.recent_decisions(50, mode))?;
         Ok(decisions
             .into_iter()
             .find(|d| d.kind == "monthly")

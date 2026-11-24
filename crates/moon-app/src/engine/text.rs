@@ -7,10 +7,11 @@ use moon_core::rebalance::RebalancePlan;
 use moon_core::risk::DrawdownState;
 use moon_core::risk_index::RiskIndex;
 use moon_core::time::art_date;
-use moon_core::types::{OrderReason, OrderStatus, Side};
+use moon_core::types::{ExecMode, OrderReason, OrderStatus, Side};
 use moon_core::weights::TargetWeights;
-use moon_store::{FlowKind, ProposalKind};
+use moon_store::{FlowKind, OrderRecord, ProposalKind, Store, StoreError};
 use rust_decimal::Decimal;
+use uuid::Uuid;
 
 use super::{
     Engine, ExecutionReport, STATE_DRAWDOWN, STATE_NAV, STATE_RISK_INDEX, UNKNOWN_OUTCOME,
@@ -60,6 +61,56 @@ fn weight_pct(value: Decimal, equity: Decimal) -> String {
     format!("{}%", (value / equity * Decimal::ONE_HUNDRED).round_dp(1))
 }
 
+/// Short form of an order id (first 8 hex characters of the UUID), shown in every order line.
+pub fn short_id(id: Uuid) -> String {
+    id.simple().to_string().chars().take(8).collect()
+}
+
+fn is_unknown_outcome(o: &OrderRecord) -> bool {
+    o.status == OrderStatus::Failed
+        && o.error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(UNKNOWN_OUTCOME))
+}
+
+/// Orders that need attention: open ones and those with an unknown outcome (or only the latter
+/// when `unknown_only`), oldest first.
+pub(crate) fn unresolved_orders(
+    store: &Store,
+    mode: ExecMode,
+    unknown_only: bool,
+) -> Result<Vec<OrderRecord>, StoreError> {
+    let mut orders = if unknown_only {
+        Vec::new()
+    } else {
+        store.open_orders(mode)?
+    };
+    orders.extend(
+        store
+            .orders_with_status(mode, OrderStatus::Failed)?
+            .into_iter()
+            .filter(is_unknown_outcome),
+    );
+    orders.sort_by_key(|o| o.created_at);
+    Ok(orders)
+}
+
+/// One line describing a stored order, led by its short id.
+pub(crate) fn order_line(o: &OrderRecord) -> String {
+    let mut line = format!(
+        "• {} {} {}: {} — {}",
+        short_id(o.id),
+        side_es(o.side),
+        o.symbol,
+        o.qty,
+        status_es(o.status)
+    );
+    if let Some(e) = &o.error {
+        line.push_str(&format!(" [{e}]"));
+    }
+    line
+}
+
 /// Summary of an execution batch.
 pub(crate) fn execution_summary(reason: OrderReason, report: &ExecutionReport) -> String {
     let unknown = report.orders.iter().any(|o| {
@@ -86,7 +137,8 @@ pub(crate) fn execution_summary(reason: OrderReason, report: &ExecutionReport) -
             .map_or_else(|| "a mercado".to_string(), ars);
         let est = if o.fees_estimated { " (estimada)" } else { "" };
         let mut line = format!(
-            "• {} {}: {} de {} a {} — {}; ejecutado {}; comisión {}{est}",
+            "• {} {} {}: {} de {} a {} — {}; ejecutado {}; comisión {}{est}",
+            short_id(o.id),
             side_es(o.side),
             o.symbol,
             o.qty,
@@ -169,8 +221,8 @@ impl Engine {
             ),
             _ => "Freno: sin observaciones todavía".to_string(),
         };
-        let decision = self.db(|s| s.recent_decisions(1))?;
-        let open_orders = self.db(|s| s.open_orders(mode))?.len();
+        let decision = self.db(|s| s.recent_decisions(1, mode))?;
+        let unresolved = self.db(|s| unresolved_orders(s, mode, false))?;
         let pending = self.db(|s| s.pending_proposals())?.len();
 
         let mut lines = vec![
@@ -213,8 +265,10 @@ impl Engine {
             None => "Última decisión: ninguna".to_string(),
         });
         lines.push(format!(
-            "Órdenes abiertas: {open_orders} · Propuestas pendientes: {pending}"
+            "Órdenes abiertas o con resultado desconocido: {} · Propuestas pendientes: {pending}",
+            unresolved.len()
         ));
+        lines.extend(unresolved.iter().map(order_line));
         Ok(lines.join("\n"))
     }
 
@@ -254,23 +308,40 @@ impl Engine {
             "comisiones"
         };
 
-        // Deposits and withdrawals of the week and the equity bridge (USD at today's CCL).
+        // Deposits and withdrawals of the week and the equity bridge. Only flows after the first
+        // snapshot count: earlier ones are already inside the initial equity. Each flow is
+        // converted with the CCL of the first snapshot at or after it (fallback: the latest).
+        let flow_from = snapshots.first().map_or(week_ago, |first| first.at);
         let flows: Vec<_> = self
-            .db(|s| s.flows_between(mode, week_ago, now))?
+            .db(|s| s.flows_between(mode, flow_from, now))?
             .into_iter()
-            .filter(|f| f.at > week_ago)
+            .filter(|f| f.at > flow_from)
             .collect();
-        let deposits: Decimal = flows
-            .iter()
-            .filter(|f| f.kind == FlowKind::Deposit)
-            .map(|f| f.amount_ars.abs())
-            .sum();
-        let withdrawals: Decimal = flows
-            .iter()
-            .filter(|f| f.kind == FlowKind::Withdrawal)
-            .map(|f| f.amount_ars.abs())
-            .sum();
-        let net_usd = round_money((deposits - withdrawals) / v.ccl);
+        let fallback_ccl = snapshots.last().map_or(v.ccl, |last| last.ccl);
+        let ccl_for = |at| {
+            snapshots
+                .iter()
+                .find(|s| s.at >= at)
+                .map_or(fallback_ccl, |s| s.ccl)
+        };
+        let sum_flows = |kind: FlowKind| -> (Decimal, Decimal) {
+            flows.iter().filter(|f| f.kind == kind).fold(
+                (Decimal::ZERO, Decimal::ZERO),
+                |(ars_sum, usd_sum), f| {
+                    let amount = f.amount_ars.abs();
+                    let ccl = ccl_for(f.at);
+                    let usd = if ccl > Decimal::ZERO {
+                        amount / ccl
+                    } else {
+                        Decimal::ZERO
+                    };
+                    (ars_sum + amount, usd_sum + usd)
+                },
+            )
+        };
+        let (deposits, deposits_usd) = sum_flows(FlowKind::Deposit);
+        let (withdrawals, withdrawals_usd) = sum_flows(FlowKind::Withdrawal);
+        let net_usd = round_money(deposits_usd - withdrawals_usd);
         let bridge = match snapshots.first() {
             Some(first) => {
                 let result = v.equity_usd - first.equity_usd - net_usd;

@@ -7,12 +7,12 @@ use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use moon_core::fees::FeeModel;
 use moon_core::money::round_money;
-use moon_core::types::OrderStatus;
+use moon_core::types::{ExecMode, OrderStatus};
 use moon_store::Store;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, TradingMode};
 use crate::engine::UNKNOWN_OUTCOME;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -120,15 +120,74 @@ pub fn resolve_order(
     Ok(msg)
 }
 
+/// Minimum length of an order id prefix accepted by `moon orders resolve`.
+const MIN_PREFIX_LEN: usize = 6;
+
+/// Finds the order whose id is `input` (full UUID) or the unique order starting with it.
+pub fn find_order_id(store: &Store, input: &str) -> anyhow::Result<Uuid> {
+    let input = input.trim();
+    if let Ok(id) = Uuid::parse_str(input) {
+        return Ok(id);
+    }
+    if input.len() < MIN_PREFIX_LEN {
+        bail!(
+            "El identificador debe tener al menos {MIN_PREFIX_LEN} caracteres (usá el que muestra `moon orders list`)."
+        );
+    }
+    let candidates = store.orders_by_id_prefix(input)?;
+    match candidates.as_slice() {
+        [] => bail!("No existe ninguna orden cuyo identificador empiece con «{input}»."),
+        [one] => Ok(one.id),
+        many => {
+            let list = many
+                .iter()
+                .map(crate::engine::order_line)
+                .collect::<Vec<_>>()
+                .join("\n");
+            bail!(
+                "El prefijo «{input}» es ambiguo, coincide con {} órdenes:\n{list}\nUsá un prefijo más largo.",
+                many.len()
+            )
+        }
+    }
+}
+
+/// Text of `moon orders list`.
+pub fn list_text(store: &Store, mode: ExecMode, unknown_only: bool) -> anyhow::Result<String> {
+    let orders = crate::engine::unresolved_orders(store, mode, unknown_only)?;
+    if orders.is_empty() {
+        return Ok(if unknown_only {
+            "No hay órdenes con resultado desconocido.".to_string()
+        } else {
+            "No hay órdenes abiertas ni con resultado desconocido.".to_string()
+        });
+    }
+    let mut lines = vec![format!("{} orden(es):", orders.len())];
+    lines.extend(orders.iter().map(crate::engine::order_line));
+    Ok(lines.join("\n"))
+}
+
+/// CLI entry of `moon orders list`: read-only.
+pub fn run_list(cfg: &AppConfig, unknown_only: bool) -> anyhow::Result<()> {
+    let store = Store::open(&cfg.database_path)?;
+    let mode = match cfg.mode {
+        TradingMode::Paper => ExecMode::Paper,
+        TradingMode::LiveConfirm | TradingMode::LiveAuto => ExecMode::Live,
+    };
+    println!("{}", list_text(&store, mode, unknown_only)?);
+    Ok(())
+}
+
 /// CLI entry: opens the database of the configuration and resolves the order. Never calls IOL.
 pub fn run_resolve(
     cfg: &AppConfig,
-    id: Uuid,
+    id: &str,
     outcome: ResolveOutcome,
     qty: Option<Decimal>,
     price: Option<Decimal>,
 ) -> anyhow::Result<()> {
     let mut store = Store::open(&cfg.database_path)?;
+    let id = find_order_id(&store, id)?;
     let msg = resolve_order(&mut store, &cfg.fees, Utc::now(), id, outcome, qty, price)?;
     println!("{msg}");
     Ok(())

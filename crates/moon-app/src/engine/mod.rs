@@ -36,7 +36,8 @@ use crate::notify::Notifier;
 pub use crate::scheduler::previous_trading_day;
 pub use jobs::monthly_batch_id;
 pub use reconcile::{Discrepancy, order_id_for, order_id_for_tranche, reconcile_positions};
-pub(crate) use text::status_es;
+pub use text::short_id;
+pub(crate) use text::{order_line, status_es, unresolved_orders};
 
 // Global keys.
 pub const STATE_PAUSED: &str = "paused";

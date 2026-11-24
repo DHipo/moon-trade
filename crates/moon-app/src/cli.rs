@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
-use uuid::Uuid;
 
 use crate::commands::orders::ResolveOutcome;
 use rust_decimal::Decimal;
@@ -85,11 +84,18 @@ pub enum CheckCmd {
 
 #[derive(Subcommand)]
 pub enum OrdersCmd {
+    /// Lista las órdenes abiertas o con resultado desconocido, con su identificador corto
+    List {
+        /// Solo las de resultado desconocido
+        #[arg(long)]
+        unknown: bool,
+    },
     /// Registra a mano el resultado de una orden con resultado desconocido, después de verificarlo
     /// en IOL (solo modifica la base local: no llama a IOL)
     Resolve {
-        /// Identificador de la orden (el que muestran los avisos)
-        order_id: Uuid,
+        /// Identificador de la orden o un prefijo único de al menos 6 caracteres (el que muestran
+        /// los avisos y `moon orders list`)
+        order_id: String,
         /// Qué pasó en IOL: filled (ejecutada) o cancelled (inexistente o cancelada)
         outcome: ResolveOutcome,
         /// Cantidad ejecutada (por defecto la de la orden; en cancelled, para una ejecución parcial)

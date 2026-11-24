@@ -1,8 +1,9 @@
 use chrono::{TimeZone, Utc};
 use clap::Parser;
 use moon_app::cli::{Cli, Command, OrdersCmd};
-use moon_app::commands::orders::{ResolveOutcome, resolve_order};
+use moon_app::commands::orders::{ResolveOutcome, find_order_id, list_text, resolve_order};
 use moon_app::engine::UNKNOWN_OUTCOME;
+use moon_app::engine::short_id;
 use moon_core::asset::{AssetId, Currency, Market};
 use moon_core::fees::FeeModel;
 use moon_core::types::{ExecMode, OrderReason, OrderStatus, Side};
@@ -221,6 +222,104 @@ fn cli_parses_orders_resolve() {
             assert_eq!(qty, Some(dec!(5)));
             assert_eq!(price, Some(dec!(100.5)));
         }
+        _ => panic!("expected orders resolve"),
+    }
+}
+
+// --- N6: short ids, prefixes, listing ---
+
+#[test]
+fn short_id_is_the_first_eight_hex_characters() {
+    let id = Uuid::parse_str("1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d").expect("uuid");
+    assert_eq!(moon_app::engine::short_id(id), "1a2b3c4d");
+}
+
+#[test]
+fn resolve_accepts_a_unique_prefix_of_six_or_more_characters() {
+    let order = unknown_order(Some(dec!(9700)));
+    let store = store_with(&order);
+    let short = moon_app::engine::short_id(order.id);
+    assert_eq!(find_order_id(&store, &short).expect("short"), order.id);
+    assert_eq!(find_order_id(&store, &short[..6]).expect("six"), order.id);
+    assert_eq!(
+        find_order_id(&store, &order.id.to_string().to_uppercase()).expect("full"),
+        order.id
+    );
+    // Too short.
+    let err = find_order_id(&store, &short[..5]).expect_err("short prefix");
+    assert!(err.to_string().contains("al menos 6"), "{err}");
+    // Unknown prefix (valid hex, no order) and non-hex input.
+    let other = if short.starts_with('0') {
+        "ffffff"
+    } else {
+        "000000"
+    };
+    let err = find_order_id(&store, other).expect_err("unknown");
+    assert!(err.to_string().contains("No existe"), "{err}");
+    let err = find_order_id(&store, "%%%%%%").expect_err("wildcards");
+    assert!(err.to_string().contains("No existe"), "{err}");
+}
+
+#[test]
+fn ambiguous_prefix_lists_the_candidates() {
+    let mut a = unknown_order(Some(dec!(9700)));
+    let mut b = unknown_order(Some(dec!(9700)));
+    a.id = Uuid::parse_str("1a2b3c4d-5e6f-4a7b-8c9d-000000000001").expect("uuid");
+    b.id = Uuid::parse_str("1a2b3c4d-5e6f-4a7b-8c9d-000000000002").expect("uuid");
+    let mut store = store_with(&a);
+    store.insert_order(&b).expect("insert");
+    let err = find_order_id(&store, "1a2b3c").expect_err("ambiguous");
+    let msg = err.to_string();
+    assert!(msg.contains("ambiguo"), "{msg}");
+    assert_eq!(msg.matches("AAA").count(), 2, "{msg}");
+    // The full id still resolves.
+    assert_eq!(
+        find_order_id(&store, &a.id.to_string()).expect("full"),
+        a.id
+    );
+}
+
+#[test]
+fn orders_list_shows_open_and_unknown_orders_with_short_ids() {
+    let unknown = unknown_order(Some(dec!(9700)));
+    let mut open = unknown_order(Some(dec!(9700)));
+    open.status = OrderStatus::Sent;
+    open.error = None;
+    let mut done = unknown_order(Some(dec!(9700)));
+    done.status = OrderStatus::Filled;
+    done.error = None;
+    let mut store = store_with(&unknown);
+    store.insert_order(&open).expect("insert");
+    store.insert_order(&done).expect("insert");
+
+    let all = list_text(&store, ExecMode::Live, false).expect("list");
+    assert!(all.contains(&short_id(unknown.id)), "{all}");
+    assert!(all.contains(&short_id(open.id)), "{all}");
+    assert!(!all.contains(&short_id(done.id)), "{all}");
+
+    let only_unknown = list_text(&store, ExecMode::Live, true).expect("list");
+    assert!(only_unknown.contains(&short_id(unknown.id)));
+    assert!(!only_unknown.contains(&short_id(open.id)));
+
+    let empty = list_text(&store, ExecMode::Paper, false).expect("list");
+    assert!(empty.contains("No hay"), "{empty}");
+}
+
+#[test]
+fn cli_parses_orders_list_and_prefix_resolve() {
+    let cli = Cli::try_parse_from(["moon", "orders", "list", "--unknown"]).expect("parse");
+    assert!(matches!(
+        cli.command,
+        Command::Orders {
+            cmd: OrdersCmd::List { unknown: true }
+        }
+    ));
+    let cli =
+        Cli::try_parse_from(["moon", "orders", "resolve", "1a2b3c", "cancelled"]).expect("parse");
+    match cli.command {
+        Command::Orders {
+            cmd: OrdersCmd::Resolve { order_id, .. },
+        } => assert_eq!(order_id, "1a2b3c"),
         _ => panic!("expected orders resolve"),
     }
 }

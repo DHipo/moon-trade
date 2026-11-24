@@ -82,7 +82,6 @@ struct ApiResponse {
 
 #[derive(Deserialize)]
 struct Update {
-    update_id: i64,
     message: Option<Message>,
     callback_query: Option<CallbackQuery>,
 }
@@ -95,6 +94,11 @@ struct Message {
 }
 
 #[derive(Deserialize)]
+struct User {
+    id: i64,
+}
+
+#[derive(Deserialize)]
 struct Chat {
     id: i64,
 }
@@ -102,6 +106,7 @@ struct Chat {
 #[derive(Deserialize)]
 struct CallbackQuery {
     id: String,
+    from: Option<User>,
     data: Option<String>,
     message: Option<Message>,
 }
@@ -241,27 +246,46 @@ impl TelegramClient {
         });
         let timeout = Duration::from_secs(u64::from(timeout_secs) + POLL_TIMEOUT_MARGIN_SECS);
         let result = self.call("getUpdates", &body, Some(timeout)).await?;
-        let updates: Vec<Update> = serde_json::from_value(result)
-            .map_err(|e| TelegramError::Parse(format!("getUpdates: {e}")))?;
-        Ok(updates
-            .into_iter()
-            .map(|u| Incoming {
-                update_id: u.update_id,
-                kind: self.classify(u),
-            })
-            .collect())
+        let Value::Array(items) = result else {
+            return Err(TelegramError::Parse(
+                "getUpdates: se esperaba una lista".to_string(),
+            ));
+        };
+        // Each update is parsed on its own: one malformed update must not block the others
+        // nor stall the offset.
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let Some(update_id) = item.get("update_id").and_then(Value::as_i64) else {
+                tracing::warn!("update de Telegram sin update_id legible; se omite");
+                continue;
+            };
+            let kind = match serde_json::from_value::<Update>(item) {
+                Ok(u) => self.classify(u),
+                Err(e) => {
+                    tracing::warn!(update_id, "update de Telegram malformado: {e}");
+                    IncomingKind::Other
+                }
+            };
+            out.push(Incoming { update_id, kind });
+        }
+        Ok(out)
     }
 
     /// Anything not coming from the configured chat becomes `Other`.
     fn classify(&self, update: Update) -> IncomingKind {
         if let Some(cb) = update.callback_query {
             let chat = cb.message.as_ref().map(|m| m.chat.id);
-            return match (chat, cb.data) {
-                (Some(chat), Some(data)) if chat == self.chat_id => IncomingKind::Callback {
-                    id: cb.id,
-                    data,
-                    message_id: cb.message.map(|m| m.message_id),
-                },
+            let from = cb.from.as_ref().map(|u| u.id);
+            return match (chat, from, cb.data) {
+                (Some(chat), Some(from), Some(data))
+                    if chat == self.chat_id && from == self.chat_id =>
+                {
+                    IncomingKind::Callback {
+                        id: cb.id,
+                        data,
+                        message_id: cb.message.map(|m| m.message_id),
+                    }
+                }
                 _ => IncomingKind::Other,
             };
         }

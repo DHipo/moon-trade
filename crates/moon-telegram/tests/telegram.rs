@@ -94,7 +94,7 @@ async fn poll_parses_command_and_callback() {
         .and(path("/botTEST_TOKEN/getUpdates"))
         .respond_with(ok(json!([
             {"update_id": 10, "message": {"message_id": 1, "chat": {"id": 42}, "text": "/estado"}},
-            {"update_id": 11, "callback_query": {"id": "cb9", "data": "approve:1",
+            {"update_id": 11, "callback_query": {"id": "cb9", "from": {"id": 42}, "data": "approve:1",
                 "message": {"message_id": 33, "chat": {"id": 42}}}},
             {"update_id": 12, "message": {"message_id": 2, "chat": {"id": 42}, "text": "hola"}}
         ])))
@@ -142,6 +142,48 @@ async fn poll_ignores_other_chats() {
     assert_eq!(ups[0].update_id, 20);
     assert_eq!(ups[0].kind, IncomingKind::Other);
     assert_eq!(ups[1].kind, IncomingKind::Other);
+}
+
+#[tokio::test]
+async fn callbacks_from_another_user_are_ignored() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/botTEST_TOKEN/getUpdates"))
+        .respond_with(ok(json!([
+            {"update_id": 30, "callback_query": {"id": "a", "from": {"id": 7}, "data": "approve:1",
+                "message": {"message_id": 3, "chat": {"id": 42}}}},
+            {"update_id": 31, "callback_query": {"id": "b", "data": "approve:1",
+                "message": {"message_id": 3, "chat": {"id": 42}}}}
+        ])))
+        .mount(&server)
+        .await;
+    let ups = client(&server).poll(0, 0).await.unwrap();
+    assert_eq!(ups.len(), 2);
+    assert_eq!(ups[0].kind, IncomingKind::Other);
+    assert_eq!(ups[1].kind, IncomingKind::Other);
+}
+
+#[tokio::test]
+async fn malformed_update_does_not_block_the_rest() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/botTEST_TOKEN/getUpdates"))
+        .respond_with(ok(json!([
+            {"update_id": 40, "message": {"message_id": "not-a-number", "chat": 5}},
+            {"update_id": "garbage", "message": {"message_id": 1, "chat": {"id": 42}, "text": "/x"}},
+            {"message": {"message_id": 1, "chat": {"id": 42}, "text": "/y"}},
+            {"update_id": 42, "message": {"message_id": 2, "chat": {"id": 42}, "text": "/estado"}}
+        ])))
+        .mount(&server)
+        .await;
+    let ups = client(&server).poll(0, 0).await.unwrap();
+    assert_eq!(ups.len(), 2);
+    assert_eq!(ups[0].update_id, 40);
+    assert_eq!(ups[0].kind, IncomingKind::Other);
+    assert_eq!(ups[1].update_id, 42);
+    assert!(matches!(ups[1].kind, IncomingKind::Command { .. }));
+    // The caller derives the next offset from the highest readable id.
+    assert_eq!(ups.iter().map(|u| u.update_id).max(), Some(42));
 }
 
 #[tokio::test]

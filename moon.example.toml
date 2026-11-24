@@ -1,0 +1,147 @@
+# moon-trade: configuración de ejemplo. Copiala a moon.toml y revisá cada valor.
+# Los instrumentos y números son EJEMPLOS para probar, no recomendaciones de inversión.
+mode = "paper"              # paper | live_confirm | live_auto
+database_path = "moon.db"
+log_dir = "logs"
+
+[live]
+enabled = false             # doble confirmación: sin esto el bot nunca opera en real
+
+[iol]
+base_url = "https://api.iolinversiones.com"
+
+[telegram]
+enabled = false
+
+[paper]
+initial_cash_ars = 1000000
+
+# --- Universo (verificá ratios de CEDEAR y tickers en IOL) ---
+[[assets]]
+id = "SPY"
+role = "risky"
+signal_symbol = "SPY"
+cedear_ratio = 20.0
+exec = { symbol = "SPY", market = "BCBA", currency = "ARS" }
+
+[[assets]]
+id = "QQQ"
+role = "risky"
+signal_symbol = "QQQ"
+cedear_ratio = 20.0
+exec = { symbol = "QQQ", market = "BCBA", currency = "ARS" }
+
+[[assets]]
+id = "IWM"
+role = "risky"
+signal_symbol = "IWM"
+cedear_ratio = 10.0
+exec = { symbol = "IWM", market = "BCBA", currency = "ARS" }
+
+[[assets]]
+id = "EEM"
+role = "risky"
+signal_symbol = "EEM"
+cedear_ratio = 5.0
+exec = { symbol = "EEM", market = "BCBA", currency = "ARS" }
+
+[[assets]]
+id = "GLD"
+role = "risky"
+signal_symbol = "GLD"
+cedear_ratio = 50.0
+exec = { symbol = "GLD", market = "BCBA", currency = "ARS" }
+
+# Refugio: CASH = quedarse en pesos (ojo: pierde valor en dólares). Elegí tu refugio.
+[[assets]]
+id = "CASH"
+role = "refuge"
+
+[[assets]]
+id = "VWO"
+role = "canary"
+signal_symbol = "VWO"
+
+[[assets]]
+id = "BND"
+role = "canary"
+signal_symbol = "BND"
+
+[[assets]]
+id = "BENCH_SPY"
+role = "benchmark"
+signal_symbol = "SPY"
+
+[allocation]
+sizing = "inverse_vol"       # equal | inverse_vol
+vol_lookback_days = 63
+canary_threshold = 2
+
+[[allocation.strategies]]
+kind = "faber_sma"
+months = 10
+
+[[allocation.strategies]]
+kind = "dual_momentum"
+lookback_months = 12
+top_n = 3
+
+[risk]
+max_weight = 0.20
+max_drawdown = 0.15
+rebalance_band = 0.05
+min_trade_usd = 20
+max_order_usd = 5000
+max_orders_per_day = 20
+cash_buffer = 0.01
+# max_equity_usd = 10000
+
+[fees]                       # comisiones en vivo (montos en ARS). VERIFICAR con IOL.
+commission_rate = 0.006
+market_fee_rate = 0.0008
+vat_rate = 0.21
+min_commission = 0
+
+[execution]
+slippage_rate = 0.003
+limit_tolerance = 0.005
+price_tick = 0.01            # VERIFICAR el tick de precio de BYMA
+settlement_term = "T1"
+order_type = "limit"
+quote_source = "iol"         # iol | yahoo
+approval_timeout_minutes = 240
+fill_timeout_minutes = 20
+poll_interval_seconds = 30
+
+[fx]                         # CCL implícito: local ARS / (ADR USD / ratio). VERIFICAR ratios.
+min_pairs = 2
+pairs = [
+  { local_symbol = "GGAL", adr_symbol = "GGAL", adr_market = "NASDAQ", ratio = 10 },
+  { local_symbol = "YPFD", adr_symbol = "YPF", adr_market = "NYSE", ratio = 1 },
+  { local_symbol = "PAMP", adr_symbol = "PAM", adr_market = "NYSE", ratio = 25 },
+  { local_symbol = "BMA", adr_symbol = "BMA", adr_market = "NYSE", ratio = 10 },
+]
+
+[schedule]                   # hora Argentina
+market_open = "11:00:00"
+market_close = "17:00:00"
+monthly_time = "11:30:00"
+daily_close_time = "17:30:00"
+risk_check_every_minutes = 15
+weekly_report_weekday = "Fri"
+weekly_report_time = "18:00:00"
+holidays = []                # feriados de BYMA, ej. ["2026-12-08"]
+
+[backtest]
+start = "2008-01-01"
+initial_capital = 10000      # USD
+monthly_contribution = 0
+slippage_rate = 0.003
+holdout_start = "2023-01-01" # período virgen: no mirarlo hasta la validación final
+risk_free_rate = 0.0
+
+[backtest.fees]              # comisiones del backtest (montos en USD)
+commission_rate = 0.006
+market_fee_rate = 0.0008
+vat_rate = 0.21
+min_commission = 0

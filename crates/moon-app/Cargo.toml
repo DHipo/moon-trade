@@ -5,12 +5,42 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+name = "moon_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "moon"
 path = "src/main.rs"
 
 [dependencies]
+moon-core.workspace = true
+moon-store.workspace = true
+moon-yahoo.workspace = true
+moon-iol.workspace = true
+moon-telegram.workspace = true
+moon-broker.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
 clap.workspace = true
+dotenvy.workspace = true
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rust_decimal_macros.workspace = true
+wiremock.workspace = true
+moon-core = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

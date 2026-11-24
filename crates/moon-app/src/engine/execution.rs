@@ -456,8 +456,10 @@ impl Engine {
                     .is_some_and(|e| e.starts_with(UNKNOWN_OUTCOME)))
             .then(|| {
                 format!(
-                    "La orden de {} quedó con resultado desconocido en un intento anterior: verificá en IOL.",
-                    existing.symbol
+                    "La orden {} de {} quedó con resultado desconocido en un intento anterior: verificá en IOL y después usá `moon orders resolve {}`.",
+                    super::text::short_id(existing.id),
+                    existing.symbol,
+                    super::text::short_id(existing.id)
                 )
             });
             return Ok(SendOutcome { id, halt });
@@ -482,9 +484,11 @@ impl Engine {
                 rec.status = OrderStatus::Failed;
                 rec.error = Some(format!("{UNKNOWN_OUTCOME} {e}"));
                 halt = Some(format!(
-                    "La orden de {} {} tuvo un resultado desconocido ({e}): verificá en IOL antes de operar. No se reenvía.",
+                    "La orden {} de {} {} tuvo un resultado desconocido ({e}): verificá en IOL antes de operar y después usá `moon orders resolve {}`. No se reenvía.",
+                    super::text::short_id(id),
                     super::text::side_es(order.side),
-                    exec.symbol
+                    exec.symbol,
+                    super::text::short_id(id)
                 ));
             }
             Ok(res) => {

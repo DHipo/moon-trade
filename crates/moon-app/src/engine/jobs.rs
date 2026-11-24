@@ -690,7 +690,13 @@ impl Engine {
                         .is_some_and(|e| e.starts_with(UNKNOWN_OUTCOME))
             };
             if mine.iter().any(is_unknown) {
-                unknown.push(symbol);
+                let ids: Vec<String> = mine
+                    .iter()
+                    .copied()
+                    .filter(is_unknown)
+                    .map(|o| super::text::short_id(o.id))
+                    .collect();
+                unknown.push(format!("{symbol} (orden {})", ids.join(", ")));
                 continue; // never re-send an order whose outcome is unknown
             }
             // A limit order that did not fill (rejected or cancelled) is replaced by a market order.

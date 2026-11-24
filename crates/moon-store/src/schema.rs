@@ -108,4 +108,6 @@ CREATE TABLE backtest_runs (
 ",
     // Version 2: cash including committed funds, for cash reconciliation.
     "ALTER TABLE snapshots ADD COLUMN cash_total_ars TEXT NULL;",
+    // Version 3: decisions are kept per execution mode (NULL on rows written before).
+    "ALTER TABLE decisions ADD COLUMN mode TEXT NULL;",
 ];

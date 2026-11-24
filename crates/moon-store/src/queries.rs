@@ -550,6 +550,40 @@ impl Store {
             .collect())
     }
 
+    /// Orders of a mode in the given status, oldest first.
+    pub fn orders_with_status(
+        &self,
+        mode: ExecMode,
+        status: OrderStatus,
+    ) -> Result<Vec<OrderRecord>, StoreError> {
+        query_all(
+            &self.conn,
+            &format!(
+                "SELECT {ORDER_COLS} FROM orders WHERE mode = ?1 AND status = ?2 \
+                 ORDER BY created_at ASC, rowid ASC"
+            ),
+            params![mode.as_str(), status.as_str()],
+            order_from_row,
+        )
+    }
+
+    /// Orders (any mode) whose id starts with `prefix` (hex digits and dashes only; anything
+    /// else matches nothing), oldest first.
+    pub fn orders_by_id_prefix(&self, prefix: &str) -> Result<Vec<OrderRecord>, StoreError> {
+        if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            return Ok(Vec::new());
+        }
+        query_all(
+            &self.conn,
+            &format!(
+                "SELECT {ORDER_COLS} FROM orders WHERE lower(id) LIKE ?1 \
+                 ORDER BY created_at ASC, rowid ASC"
+            ),
+            [format!("{}%", prefix.to_ascii_lowercase())],
+            order_from_row,
+        )
+    }
+
     /// Orders with `from <= created_at <= to`, ascending.
     pub fn orders_between(
         &self,
@@ -725,24 +759,42 @@ impl Store {
 
     // --- decision log ---
 
+    /// Logs a decision of the given execution mode.
     pub fn log_decision(
         &mut self,
         at: DateTime<Utc>,
         kind: &str,
+        mode: ExecMode,
         payload: &serde_json::Value,
     ) -> Result<i64, StoreError> {
         self.conn.execute(
-            "INSERT INTO decisions (at, kind, payload) VALUES (?1, ?2, ?3)",
-            params![enc_ts(at), kind, serde_json::to_string(payload)?],
+            "INSERT INTO decisions (at, kind, mode, payload) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                enc_ts(at),
+                kind,
+                mode.as_str(),
+                serde_json::to_string(payload)?
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Newest first.
-    pub fn recent_decisions(&self, limit: usize) -> Result<Vec<DecisionRecord>, StoreError> {
+    /// Decisions of one mode, newest first. Rows written before schema v3 have no mode: they
+    /// count as paper decisions and are never returned for live.
+    pub fn recent_decisions(
+        &self,
+        limit: usize,
+        mode: ExecMode,
+    ) -> Result<Vec<DecisionRecord>, StoreError> {
+        let filter = match mode {
+            ExecMode::Paper => "(mode = 'paper' OR mode IS NULL)",
+            ExecMode::Live => "mode = 'live'",
+        };
         query_all(
             &self.conn,
-            "SELECT id, at, kind, payload FROM decisions ORDER BY id DESC LIMIT ?1",
+            &format!(
+                "SELECT id, at, kind, payload FROM decisions WHERE {filter}                  ORDER BY id DESC LIMIT ?1"
+            ),
             [i64::try_from(limit).unwrap_or(i64::MAX)],
             decision_from_row,
         )

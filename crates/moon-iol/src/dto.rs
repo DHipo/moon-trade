@@ -3,7 +3,31 @@ use moon_core::asset::Market;
 use moon_core::bars::Bar;
 use moon_core::time::art_date;
 use moon_core::types::{OrderType, Side, Term};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Accepts a JSON string or an integer and yields a string (IOL ids come in both shapes).
+pub fn string_or_number<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Id {
+        Text(String),
+        Int(i64),
+        Uint(u64),
+        Float(f64),
+    }
+    match Id::deserialize(d)? {
+        Id::Text(s) => Ok(s),
+        Id::Int(i) => Ok(i.to_string()),
+        Id::Uint(u) => Ok(u.to_string()),
+        Id::Float(f) if f.is_finite() && f.fract() == 0.0 && f.abs() < 9.0e15 => {
+            Ok(format!("{f:.0}"))
+        }
+        Id::Float(f) => Err(serde::de::Error::custom(format!("id inválido: {f}"))),
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IolBar {
@@ -150,6 +174,7 @@ pub struct IolMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IolOrderAck {
+    #[serde(deserialize_with = "string_or_number")]
     pub order_id: String,
     pub successful_purchase: bool,
     #[serde(default)]
@@ -193,6 +218,7 @@ pub struct IolOpAmounts {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IolOperation {
+    #[serde(deserialize_with = "string_or_number")]
     pub order_id: String,
     pub status: String,
     pub symbol: Option<String>,
@@ -211,6 +237,7 @@ pub struct IolFees {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IolActivity {
+    #[serde(deserialize_with = "string_or_number")]
     pub id: String,
     pub activity_type: Option<String>,
     pub trade_date: Option<String>,
@@ -222,8 +249,40 @@ pub struct IolActivity {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct IolCancel {
+    #[serde(deserialize_with = "string_or_number")]
     pub order_id: String,
     pub status: Option<String>,
     #[serde(default)]
     pub cancelled: bool,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn ids_accept_number_or_string() {
+        let a: IolOrderAck =
+            serde_json::from_value(json!({"order_id": 12345, "successful_purchase": true}))
+                .unwrap();
+        assert_eq!(a.order_id, "12345");
+        let a: IolOrderAck =
+            serde_json::from_value(json!({"order_id": "ab-1", "successful_purchase": true}))
+                .unwrap();
+        assert_eq!(a.order_id, "ab-1");
+        let o: IolOperation =
+            serde_json::from_value(json!({"order_id": 77, "status": "pending"})).unwrap();
+        assert_eq!(o.order_id, "77");
+        let act: IolActivity = serde_json::from_value(json!({"id": 9001})).unwrap();
+        assert_eq!(act.id, "9001");
+        let act: IolActivity = serde_json::from_value(json!({"id": "x9"})).unwrap();
+        assert_eq!(act.id, "x9");
+        let c: IolCancel =
+            serde_json::from_value(json!({"order_id": 5, "cancelled": true})).unwrap();
+        assert_eq!(c.order_id, "5");
+        assert!(serde_json::from_value::<IolActivity>(json!({"id": null})).is_err());
+        assert!(serde_json::from_value::<IolActivity>(json!({"id": 1.5})).is_err());
+    }
 }

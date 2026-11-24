@@ -70,18 +70,19 @@ impl Broker for IolBroker {
 
     async fn account(&self) -> Result<AccountState, BrokerError> {
         let balances = self.client.balances(Country::Ar).await.map_err(err)?;
-        let cash = balances.ars.as_ref().and_then(|b| {
-            b.available
-                .get(self.term)
-                .or_else(|| b.totals.get(self.term))
-        });
-        let cash_ars = match cash {
-            Some(c) => dec(c)?,
-            None => {
-                tracing::warn!("IOL no informó saldo en ARS para el plazo; se asume 0");
-                Decimal::ZERO
-            }
+        let unavailable =
+            || BrokerError::Broker("saldo en pesos no disponible en la respuesta de IOL".into());
+        let ars = balances.ars.as_ref().ok_or_else(unavailable)?;
+        let avail = ars.available.get(self.term);
+        let committed = ars.committed.get(self.term);
+        let totals = ars.totals.get(self.term);
+        let total = totals.or_else(|| avail.map(|a| a + committed.unwrap_or(0.0)));
+        let available = avail.or_else(|| totals.map(|t| (t - committed.unwrap_or(0.0)).max(0.0)));
+        let (Some(total), Some(available)) = (total, available) else {
+            return Err(unavailable());
         };
+        let cash_ars = dec(available)?;
+        let cash_total_ars = dec(total)?;
         let pos = self.client.positions(Country::Ar).await.map_err(err)?;
         let mut positions: BTreeMap<String, Decimal> = BTreeMap::new();
         let mut sellable: BTreeMap<String, Decimal> = BTreeMap::new();
@@ -97,6 +98,7 @@ impl Broker for IolBroker {
         }
         Ok(AccountState {
             cash_ars,
+            cash_total_ars,
             positions,
             sellable,
             as_of: self.clock.now(),
@@ -114,11 +116,22 @@ impl Broker for IolBroker {
             quantity: dec_to_f64(ticket.qty),
             settlement_term: Some(ticket.settlement_term),
         };
-        let ack = self
-            .client
-            .place_order(&req, ticket.idempotency_key)
-            .await
-            .map_err(err)?;
+        let ack = match self.client.place_order(&req, ticket.idempotency_key).await {
+            Ok(ack) => ack,
+            // A definite 4xx means IOL refused the order: it was not created.
+            Err(IolError::Api {
+                status, message, ..
+            }) if (400..500).contains(&status) && !matches!(status, 408 | 409 | 429) => {
+                return Ok(PlaceResult {
+                    broker_order_id: String::new(),
+                    accepted: false,
+                    messages: vec![message],
+                    fill: None,
+                });
+            }
+            // Timeouts, 5xx, 408/409/429 and unparsable replies: the outcome is unknown.
+            Err(e) => return Err(err(e)),
+        };
         Ok(PlaceResult {
             broker_order_id: ack.order_id,
             accepted: ack.successful_purchase,
@@ -144,11 +157,32 @@ impl Broker for IolBroker {
             .await
             .map_err(err)?;
         let found = ops.iter().find(|o| o.order_id == broker_order_id);
-        let (qty, price) = found
+        let (mut qty, price) = found
             .and_then(|o| o.executed.as_ref())
             .map(|e| (e.qty.unwrap_or(0.0), e.price.unwrap_or(0.0)))
             .unwrap_or((0.0, 0.0));
+        let ordered = found.and_then(|o| o.order.as_ref()).and_then(|o| o.qty);
+        if let Some(max) = ordered
+            && qty > max
+        {
+            tracing::warn!(
+                order_id = broker_order_id,
+                executed = qty,
+                ordered = max,
+                "IOL informó más cantidad ejecutada que ordenada; se limita a lo ordenado"
+            );
+            qty = max;
+        }
+        let completed_without_fill =
+            found.is_some_and(|o| o.status.eq_ignore_ascii_case("completed") && qty <= 0.0);
+        if completed_without_fill {
+            tracing::warn!(
+                order_id = broker_order_id,
+                "IOL marcó la orden como completada sin datos de ejecución; se mantiene pendiente"
+            );
+        }
         let status = match found.map(|o| o.status.to_lowercase()).as_deref() {
+            Some("completed") if completed_without_fill => OrderStatus::Sent,
             Some("completed") => OrderStatus::Filled,
             Some("pending") if qty > 0.0 => OrderStatus::PartiallyFilled,
             Some("cancelled") => OrderStatus::Cancelled,

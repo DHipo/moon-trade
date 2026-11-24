@@ -90,6 +90,7 @@ impl Broker for PaperBroker {
         let acct = self.lock()?.paper_account()?;
         Ok(AccountState {
             cash_ars: acct.cash_ars,
+            cash_total_ars: acct.cash_ars,
             sellable: acct.positions.clone(),
             positions: acct.positions,
             as_of: self.clock.now(),

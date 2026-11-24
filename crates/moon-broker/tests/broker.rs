@@ -292,6 +292,162 @@ async fn iol_place_maps_ticket_and_ack() {
 }
 
 #[tokio::test]
+async fn iol_place_definite_4xx_is_a_rejection() {
+    let (server, b) = iol_server().await;
+    Mock::given(method("POST"))
+        .and(path("/broker/orders"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "meta": {"status_code": 400}, "data": null,
+            "error": {"code": "E1", "message": "Saldo insuficiente"}
+        })))
+        .mount(&server)
+        .await;
+    let r = b
+        .place(&ticket(Side::Buy, dec!(10), Some(dec!(10))))
+        .await
+        .unwrap();
+    assert!(!r.accepted);
+    assert!(r.fill.is_none());
+    assert_eq!(r.messages, vec!["Saldo insuficiente".to_string()]);
+}
+
+#[tokio::test]
+async fn iol_place_unknown_outcomes_stay_errors() {
+    for status in [500_u16, 502, 408, 409, 429] {
+        let (server, b) = iol_server().await;
+        Mock::given(method("POST"))
+            .and(path("/broker/orders"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+                "meta": {"status_code": status}, "data": null,
+                "error": {"code": "E", "message": "falló"}
+            })))
+            .mount(&server)
+            .await;
+        let r = b.place(&ticket(Side::Buy, dec!(1), Some(dec!(10)))).await;
+        assert!(matches!(r, Err(BrokerError::Broker(_))), "{status}: {r:?}");
+    }
+    // 2xx whose body cannot be parsed: the order may exist.
+    let (server, b) = iol_server().await;
+    Mock::given(method("POST"))
+        .and(path("/broker/orders"))
+        .respond_with(ResponseTemplate::new(201).set_body_string("not json"))
+        .mount(&server)
+        .await;
+    let r = b.place(&ticket(Side::Buy, dec!(1), Some(dec!(10)))).await;
+    assert!(matches!(r, Err(BrokerError::Broker(_))), "{r:?}");
+}
+
+#[tokio::test]
+async fn iol_place_accepts_numeric_order_id() {
+    let (server, b) = iol_server().await;
+    Mock::given(method("POST"))
+        .and(path("/broker/orders"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(envelope(json!({
+            "order_id": 4242, "successful_purchase": true
+        }))))
+        .mount(&server)
+        .await;
+    let r = b
+        .place(&ticket(Side::Buy, dec!(1), Some(dec!(10))))
+        .await
+        .unwrap();
+    assert_eq!(r.broker_order_id, "4242");
+}
+
+async fn balances_account(ars: Value) -> Result<AccountState, BrokerError> {
+    let (server, b) = iol_server().await;
+    let body = if ars.is_null() {
+        json!({})
+    } else {
+        json!({ "ars": ars })
+    };
+    Mock::given(method("GET"))
+        .and(path("/broker/accounts/AR/balances"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(body)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/broker/accounts/AR/positions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!({
+            "positions": []
+        }))))
+        .mount(&server)
+        .await;
+    b.account().await
+}
+
+#[tokio::test]
+async fn iol_account_total_and_available_cash() {
+    let a = balances_account(json!({
+        "totals": {"t1": 1000.0}, "available": {"t1": 700.0}, "committed": {"t1": 300.0}
+    }))
+    .await
+    .unwrap();
+    assert_eq!(a.cash_total_ars, dec!(1000));
+    assert_eq!(a.cash_ars, dec!(700));
+    // No totals: available + committed.
+    let a = balances_account(json!({
+        "available": {"t1": 700.0}, "committed": {"t1": 300.0}
+    }))
+    .await
+    .unwrap();
+    assert_eq!(a.cash_total_ars, dec!(1000));
+    assert_eq!(a.cash_ars, dec!(700));
+    // No committed: both equal the available amount.
+    let a = balances_account(json!({"available": {"t1": 50.0}}))
+        .await
+        .unwrap();
+    assert_eq!(a.cash_total_ars, dec!(50));
+    assert_eq!(a.cash_ars, dec!(50));
+}
+
+#[tokio::test]
+async fn iol_account_missing_ars_balance_is_an_error() {
+    for ars in [json!(null), json!({}), json!({"totals": {"t0": 5.0}})] {
+        let r = balances_account(ars.clone()).await;
+        match r {
+            Err(BrokerError::Broker(m)) => {
+                assert!(m.contains("saldo en pesos no disponible"), "{m}")
+            }
+            other => panic!("{ars}: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn paper_account_total_equals_cash() {
+    let (b, _, _) = paper(dec!(1234), &[]);
+    let a = b.account().await.unwrap();
+    assert_eq!(a.cash_ars, a.cash_total_ars);
+}
+
+#[tokio::test]
+async fn iol_refresh_guards_inconsistent_completions() {
+    let (server, b) = iol_server().await;
+    Mock::given(method("GET"))
+        .and(path("/broker/accounts/activities/operations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!([
+            {"order_id": "nofill", "status": "completed"},
+            {"order_id": "zero", "status": "completed", "executed": {"qty": 0, "price": 0}},
+            {"order_id": 31, "status": "completed",
+             "order": {"qty": 10}, "executed": {"qty": 12, "price": 5.0}}
+        ]))))
+        .mount(&server)
+        .await;
+    let from = d(2026, 11, 20);
+    let p = b.refresh("nofill", from).await.unwrap();
+    assert_eq!(p.status, OrderStatus::Sent);
+    assert_eq!(p.filled_qty, dec!(0));
+    assert_eq!(
+        b.refresh("zero", from).await.unwrap().status,
+        OrderStatus::Sent
+    );
+    let p = b.refresh("31", from).await.unwrap();
+    assert_eq!(p.status, OrderStatus::Filled);
+    assert_eq!(p.filled_qty, dec!(10));
+}
+
+#[tokio::test]
 async fn iol_refresh_status_mapping() {
     let (server, b) = iol_server().await;
     Mock::given(method("GET"))

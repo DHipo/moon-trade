@@ -41,7 +41,10 @@ pub enum BrokerError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountState {
+    /// Cash available to buy with (excludes amounts committed to open orders).
     pub cash_ars: Decimal,
+    /// Total cash owned, including amounts committed to open orders; use it for equity.
+    pub cash_total_ars: Decimal,
     pub positions: BTreeMap<String, Decimal>,
     pub sellable: BTreeMap<String, Decimal>,
     pub as_of: DateTime<Utc>,

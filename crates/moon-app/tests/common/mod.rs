@@ -114,6 +114,7 @@ impl FakeBroker {
             cancels: Mutex::new(Vec::new()),
             account: Mutex::new(AccountState {
                 cash_ars,
+                cash_total_ars: cash_ars,
                 positions: BTreeMap::new(),
                 sellable: BTreeMap::new(),
                 as_of: clock_time(),
@@ -225,6 +226,7 @@ impl Broker for FakeBroker {
                 moon_core::types::Side::Sell => (held - ticket.qty, a.cash_ars + value),
             };
             a.cash_ars = cash;
+            a.cash_total_ars = cash;
             a.positions.insert(ticket.symbol.clone(), new_held);
             a.sellable.insert(ticket.symbol.clone(), new_held);
             fill = Some(OrderProgress {

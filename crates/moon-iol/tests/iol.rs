@@ -473,10 +473,42 @@ async fn operations_parse_status_and_executed() {
         })
         .await
         .unwrap();
+    assert_eq!(ops.total_count, None);
+    let ops = ops.items;
     assert_eq!(ops.len(), 2);
     assert_eq!(ops[0].status, "completed");
     assert_eq!(ops[0].executed.as_ref().unwrap().qty, Some(10.0));
     assert!(ops[1].executed.is_none());
+}
+
+#[tokio::test]
+async fn operations_report_meta_total_count_and_symbol_filter() {
+    let server = MockServer::start().await;
+    mount_login(&server, "t1", "r1", 1).await;
+    Mock::given(method("GET"))
+        .and(path("/broker/accounts/activities/operations"))
+        .and(query_param("symbol", "SPY"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "meta": {"status_code": 200, "total_count": 120},
+            "data": [{"order_id": "1", "status": "pending"}],
+            "error": null
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (c, _) = client(&server);
+    let page = c
+        .operations(&OperationsQuery {
+            start_date: NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            end_date: NaiveDate::from_ymd_opt(2026, 11, 23).unwrap(),
+            country: Some("AR".into()),
+            symbol: Some("SPY".into()),
+            state: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.total_count, Some(120));
 }
 
 #[tokio::test]

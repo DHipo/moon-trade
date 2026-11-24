@@ -209,6 +209,14 @@ pub struct OperationsQuery {
     pub state: Option<String>,
 }
 
+/// One response of the operations list. IOL documents no pagination, only
+/// `meta.total_count`, so a page may be truncated when `total_count > items.len()`.
+#[derive(Debug, Clone)]
+pub struct OperationsPage {
+    pub items: Vec<IolOperation>,
+    pub total_count: Option<u64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct IolOpAmounts {
     pub qty: Option<f64>,

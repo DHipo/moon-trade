@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::auth::{TokenData, TokenState};
 use crate::dto::{
     IolActivity, IolBalances, IolBar, IolCancel, IolEstimate, IolOperation, IolOrderAck,
-    IolOrderRequest, IolPositions, IolQuote, OperationsQuery,
+    IolOrderRequest, IolPositions, IolQuote, OperationsPage, OperationsQuery,
 };
 use crate::error::{IolCredentials, IolError};
 
@@ -164,7 +164,7 @@ impl IolClient {
         self.call(Method::POST, url, Some(body), None).await
     }
 
-    pub async fn operations(&self, q: &OperationsQuery) -> Result<Vec<IolOperation>, IolError> {
+    pub async fn operations(&self, q: &OperationsQuery) -> Result<OperationsPage, IolError> {
         let mut query = vec![
             ("start_date", q.start_date.format("%Y-%m-%d").to_string()),
             ("end_date", q.end_date.format("%Y-%m-%d").to_string()),
@@ -179,7 +179,11 @@ impl IolClient {
             query.push(("state", s.clone()));
         }
         let url = self.url(&["broker", "accounts", "activities", "operations"], &query)?;
-        self.call(Method::GET, url, None, None).await
+        let (data, meta) = self.call_raw(Method::GET, url, None, None).await?;
+        let items: Vec<IolOperation> =
+            serde_json::from_value(data).map_err(|e| IolError::Parse(e.to_string()))?;
+        let total_count = meta.get("total_count").and_then(Value::as_u64);
+        Ok(OperationsPage { items, total_count })
     }
 
     pub async fn activities(
@@ -236,6 +240,18 @@ impl IolClient {
         body: Option<Value>,
         idempotency_key: Option<Uuid>,
     ) -> Result<T, IolError> {
+        let (data, _meta) = self.call_raw(method, url, body, idempotency_key).await?;
+        serde_json::from_value(data).map_err(|e| IolError::Parse(e.to_string()))
+    }
+
+    /// Like `call`, but returns the envelope's raw `data` and `meta`.
+    async fn call_raw(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Value>,
+        idempotency_key: Option<Uuid>,
+    ) -> Result<(Value, Value), IolError> {
         let mut retried = false;
         loop {
             let access = self.access_token().await?;
@@ -258,17 +274,14 @@ impl IolClient {
                     );
                     *self.token.lock().await = None;
                 }
-                Ok(data) => {
-                    return serde_json::from_value(data)
-                        .map_err(|e| IolError::Parse(e.to_string()));
-                }
+                Ok(pair) => return Ok(pair),
                 Err(e) => return Err(e),
             }
         }
     }
 
     /// Sends the request and unwraps the `{meta, data, error}` envelope into `data`.
-    async fn execute(&self, rb: reqwest::RequestBuilder) -> Result<Value, IolError> {
+    async fn execute(&self, rb: reqwest::RequestBuilder) -> Result<(Value, Value), IolError> {
         let resp = rb.send().await?;
         let status = resp.status();
         let text = resp.text().await?;
@@ -303,7 +316,9 @@ impl IolClient {
                 message,
             });
         }
-        Ok(v.get_mut("data").map(Value::take).unwrap_or(Value::Null))
+        let meta = v.get_mut("meta").map(Value::take).unwrap_or(Value::Null);
+        let data = v.get_mut("data").map(Value::take).unwrap_or(Value::Null);
+        Ok((data, meta))
     }
 
     /// Returns a usable access token: cached, refreshed, or from a fresh login.
@@ -348,7 +363,7 @@ impl IolClient {
     /// POST /auth/token. The body (credentials) is never logged.
     async fn token_request(&self, body: Value) -> Result<TokenState, IolError> {
         let url = self.url(&["auth", "token"], &[])?;
-        let data = self.execute(self.http.post(url).json(&body)).await?;
+        let (data, _meta) = self.execute(self.http.post(url).json(&body)).await?;
         let token: TokenData =
             serde_json::from_value(data).map_err(|e| IolError::Parse(e.to_string()))?;
         Ok(token.into_state(self.clock.now()))

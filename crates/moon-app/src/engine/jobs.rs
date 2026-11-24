@@ -50,6 +50,8 @@ enum SellStep {
 
 /// Last time a refuge-buy failure was notified (per mode), to notify at most once per hour.
 const STATE_REFUGE_NOTICE: &str = "emergency_refuge_notified";
+/// Consecutive failing checks of an emergency order's status before the notice escalates.
+const REFRESH_FAILURES_BEFORE_ESCALATION: u32 = 3;
 
 impl Engine {
     // --- monthly rebalance ---
@@ -738,7 +740,28 @@ impl Engine {
             (self.cfg.execution.emergency_deep_limit_discount * Decimal::ONE_HUNDRED).normalize();
         let mut candidates: Vec<(AssetId, String, Decimal, SellStep)> = Vec::new();
         let mut unknown: Vec<String> = Vec::new();
+        // A sell of another reason (monthly, deposit, manual) that is still alive, because IOL
+        // has not confirmed its cancellation, holds the same shares: never sell them twice.
+        let working_normal_sells: Vec<OrderRecord> = self
+            .db(|s| s.open_orders(mode))?
+            .into_iter()
+            .filter(|o| o.reason != OrderReason::Emergency && o.side == Side::Sell)
+            .collect();
+        let mut waiting: Vec<String> = Vec::new();
         for (asset, symbol, qty) in held {
+            if let Some(o) = working_normal_sells.iter().find(|o| o.asset == asset) {
+                if self.notice_due(
+                    &format!("emergency_waits_for_cancel_notice:{}", o.id),
+                    Duration::hours(1),
+                ) {
+                    waiting.push(format!(
+                        "la venta de emergencia de {symbol} espera: la orden {} ({}) sigue vigente porque IOL no confirmó su cancelación. No se vende dos veces lo mismo; se reintenta la cancelación en cada control.",
+                        super::text::short_id(o.id),
+                        super::text::side_es(o.side)
+                    ));
+                }
+                continue;
+            }
             let mine: Vec<&OrderRecord> = emergency_orders
                 .iter()
                 .filter(|o| o.asset == asset && o.side == Side::Sell)
@@ -801,6 +824,15 @@ impl Engine {
             candidates.push((asset, symbol, qty, step));
         }
 
+        if !waiting.is_empty() {
+            self.deps
+                .notifier
+                .notify(&format!(
+                    "🚨 Freno por caída: ventas de emergencia en espera.\n• {}",
+                    waiting.join("\n• ")
+                ))
+                .await;
+        }
         if !unknown.is_empty() {
             let key = self.state_key(STATE_EMERGENCY_UNKNOWN);
             let mut notified: BTreeMap<String, NaiveDate> =
@@ -940,21 +972,60 @@ impl Engine {
             let Some(broker_id) = order.broker_order_id.clone() else {
                 continue;
             };
+            let id = super::text::short_id(order.id);
+            let fail_key = self.state_key(&format!("emergency_refresh_failures:{}", order.id));
             if let Err(e) = self.refresh_emergency_order(&mut order).await {
                 tracing::warn!(
                     "no se pudo actualizar la orden de emergencia {}: {e}",
                     order.id
                 );
+                // Without a status nothing is cancelled or re-sent: the owner has to know.
+                let failures = self.db(|s| s.get_state::<u32>(&fail_key))?.unwrap_or(0) + 1;
+                self.db(|s| s.set_state(&fail_key, &failures))?;
+                if failures >= REFRESH_FAILURES_BEFORE_ESCALATION {
+                    if self.notice_due(
+                        &format!("emergency_refresh_escalated_notice:{}", order.id),
+                        Duration::hours(1),
+                    ) {
+                        notes.push(format!(
+                            "no se pudo consultar el estado de la orden {id} en IOL en {failures} controles seguidos (venta de {}): verificá en IOL y considerá vender a mano (registralo con `moon orders resolve {id}`). No se reenvía.",
+                            order.symbol
+                        ));
+                    }
+                } else if self.notice_due(
+                    &format!("emergency_refresh_notice:{}", order.id),
+                    Duration::hours(1),
+                ) {
+                    notes.push(format!(
+                        "no se pudo consultar el estado de la orden {id} en IOL; se reintenta en el próximo control (venta de {}).",
+                        order.symbol
+                    ));
+                }
                 continue;
             }
-            let stale = !order.status.is_terminal()
+            if self.db(|s| s.get_state::<u32>(&fail_key))?.is_some() {
+                self.db(|s| s.delete_state(&fail_key))?;
+            }
+            let aged = !order.status.is_terminal()
                 && order.side == Side::Sell
-                && order.limit_price.is_some()
                 && self.now() - order.created_at >= window;
+            if aged
+                && order.limit_price.is_none()
+                && self.notice_due(
+                    &format!("emergency_market_pending_notice:{}", order.id),
+                    Duration::hours(1),
+                )
+            {
+                // A market order is never re-sent while it works: only tell the owner.
+                notes.push(format!(
+                    "La venta de {} a mercado (orden {id}) sigue sin ejecutarse tras {} minutos. No se reenvía mientras siga vigente: verificá en IOL y, si hace falta, vendé a mano y registralo con `moon orders resolve {id}`.",
+                    order.symbol, self.cfg.execution.emergency_reprice_minutes
+                ));
+            }
+            let stale = aged && order.limit_price.is_some();
             if !stale {
                 continue;
             }
-            let id = super::text::short_id(order.id);
             let cancel = self.deps.broker.cancel(&broker_id).await;
             // Act only on the refreshed state, whatever the cancel call said.
             let refreshed = self.refresh_emergency_order(&mut order).await;
@@ -1067,10 +1138,22 @@ impl Engine {
                 "no hay cotización del refugio {refuge}: no se puede comprar y la plata sigue en pesos"
             );
         }
-        if v.positions
+        let risky: Vec<String> = v
+            .positions
             .iter()
-            .any(|p| p.asset != refuge && p.qty > Decimal::ZERO)
-        {
+            .filter(|p| p.asset != refuge && p.qty > Decimal::ZERO)
+            .map(|p| p.asset.to_string())
+            .collect();
+        if !risky.is_empty() {
+            if self.notice_due("emergency_refuge_blocked_notice", Duration::days(1)) {
+                self.deps
+                    .notifier
+                    .notify(&format!(
+                        "🚨 Freno por caída: la compra del refugio espera: todavía queda en cartera {} (por ejemplo, una venta con resultado desconocido o sin ejecutar). Se reintenta en cada control.",
+                        risky.join(", ")
+                    ))
+                    .await;
+            }
             return Ok(());
         }
         let mode = self.exec_mode();
@@ -1123,34 +1206,15 @@ impl Engine {
             .cloned()
             .collect();
         if orders.is_empty() {
-            // Nothing to buy. That is "done" only if the refuge is held (or never was money);
-            // when the sells filled but their cash is not visible yet, wait and retry.
-            let sold: Decimal = trip_orders
-                .iter()
-                .filter(|o| o.side == Side::Sell && o.filled_qty > Decimal::ZERO)
-                .filter_map(|o| o.avg_fill_price.map(|p| round_money(o.filled_qty * p)))
-                .sum();
-            let refuge_value: Decimal = v
-                .positions
-                .iter()
-                .filter(|p| p.asset == refuge)
-                .map(|p| p.value_ars)
-                .sum();
-            let credited = v.cash_ars + refuge_value;
-            if sold > Decimal::ZERO && credited * Decimal::TWO < sold {
-                if self.notice_due("emergency_refuge_waiting_notice", Duration::days(1)) {
-                    self.deps
-                        .notifier
-                        .notify(&format!(
-                            "🚨 Freno por caída: esperando acreditación del efectivo de las ventas (vendido ARS {}, disponible ARS {}) para comprar el refugio {refuge}. Se reintenta en el próximo control.",
-                            sold.round_dp(2),
-                            v.cash_ars.round_dp(2)
-                        ))
-                        .await;
-                }
-                return Ok(());
+            // Investable cash is below the minimum trade. Done only if the sells' cash has
+            // been credited; otherwise wait and retry.
+            if self
+                .refuge_cash_settled(&v, &refuge, &trip_orders, true)
+                .await
+            {
+                self.db(|s| s.set_state(&refuge_key, &marker))?;
             }
-            return self.db(|s| s.set_state(&refuge_key, &marker));
+            return Ok(());
         }
         let plan = RebalancePlan {
             equity: full.equity,
@@ -1164,17 +1228,29 @@ impl Engine {
             .execute_refuge_buy(&plan, &targets, Uuid::new_v4())
             .await;
         match result {
-            // Held only when every order filled. Sent, cancelled or rejected buys leave the
-            // marker unset so the next check retries (an unknown outcome is caught above).
+            // After a fully filled buy, "done" only if no investable cash is left and every
+            // peso of the sells is credited; otherwise later checks buy with what is credited
+            // next. Sent, cancelled or rejected buys leave the marker unset too.
             Ok(report) => {
-                let held = report.errors.is_empty()
+                let filled = report.errors.is_empty()
                     && !report.orders.is_empty()
                     && report
                         .orders
                         .iter()
                         .all(|o| o.status == OrderStatus::Filled);
-                if held {
-                    self.db(|s| s.set_state(&refuge_key, &marker))?;
+                if filled && let Ok(v2) = self.valuation().await {
+                    let left = self
+                        .plan(&targets, &v2, true)?
+                        .buys()
+                        .into_iter()
+                        .any(|o| o.asset == refuge);
+                    if !left
+                        && self
+                            .refuge_cash_settled(&v2, &refuge, &trip_orders, false)
+                            .await
+                    {
+                        self.db(|s| s.set_state(&refuge_key, &marker))?;
+                    }
                 }
             }
             // Blocked by the order limits: already notified, retrying would not help.
@@ -1184,6 +1260,46 @@ impl Engine {
             Err(e) => return Err(e),
         }
         Ok(())
+    }
+
+    /// True when the cash of the trip's sells is (almost) all credited: cash plus refuge value
+    /// reach the sold amount, within the minimum trade or 2 %. Otherwise it may tell the owner
+    /// (once per day) that the refuge waits for the credit.
+    async fn refuge_cash_settled(
+        &self,
+        v: &Valuation,
+        refuge: &AssetId,
+        trip_orders: &[OrderRecord],
+        notify: bool,
+    ) -> bool {
+        let sold: Decimal = trip_orders
+            .iter()
+            .filter(|o| o.side == Side::Sell && o.filled_qty > Decimal::ZERO)
+            .filter_map(|o| o.avg_fill_price.map(|p| round_money(o.filled_qty * p)))
+            .sum();
+        let refuge_value: Decimal = v
+            .positions
+            .iter()
+            .filter(|p| p.asset == *refuge)
+            .map(|p| p.value_ars)
+            .sum();
+        let credited = v.cash_ars + refuge_value;
+        let tolerance =
+            round_money(self.cfg.risk.min_trade_usd * v.ccl).max(sold * Decimal::new(2, 2));
+        if sold <= Decimal::ZERO || credited + tolerance >= sold {
+            return true;
+        }
+        if notify && self.notice_due("emergency_refuge_waiting_notice", Duration::days(1)) {
+            self.deps
+                .notifier
+                .notify(&format!(
+                    "🚨 Freno por caída: esperando acreditación del efectivo de las ventas (vendido ARS {}, disponible ARS {}) para comprar el refugio {refuge}. Se reintenta en el próximo control.",
+                    sold.round_dp(2),
+                    v.cash_ars.round_dp(2)
+                ))
+                .await;
+        }
+        false
     }
 
     /// Detects deposits and withdrawals since the last check and applies them to the NAV

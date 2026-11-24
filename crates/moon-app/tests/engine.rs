@@ -1760,15 +1760,18 @@ async fn refresh_uses_the_persisted_symbol_of_the_order() {
 async fn order_missing_from_iol_after_three_refreshes_is_notified_once_per_day() {
     let h = Harness::live(TradingMode::LiveAuto, dec!(0));
     arm_breaker(&h);
+    // A market order is never re-priced, so it stays the same order across the checks.
+    h.quotes
+        .set_at("AAA", Market::Bcba, clock_time() - Duration::minutes(45));
     h.engine.run_risk_check().await.expect("trip");
     h.fake().set_not_listed(Some(Listing::NotListed));
     let id = short_id(emergency_orders(&h)[0].id);
     for _ in 0..2 {
-        h.clock.advance(Duration::minutes(1));
+        h.clock.advance(Duration::minutes(15));
         h.engine.run_risk_check().await.expect("check");
     }
     assert_eq!(count_msgs(&h, "no aparece en IOL"), 0);
-    h.clock.advance(Duration::minutes(1));
+    h.clock.advance(Duration::minutes(15));
     h.engine.run_risk_check().await.expect("third refresh");
     let notices: Vec<String> = h
         .notifier
@@ -1871,4 +1874,241 @@ async fn refuge_unknown_outcome_notice_has_short_id_and_resolve_hint() {
         .expect("notice");
     assert!(notice.contains(&short_id(refuge_buy.id)), "{notice}");
     assert!(notice.contains("moon orders resolve"), "{notice}");
+}
+
+// --- fix round 2, G1 ---
+
+/// Turns the stored emergency sell into a cancelled one and adds a working MONTHLY sell of the
+/// same shares (its cancel is never confirmed by the fake broker unless told otherwise).
+fn replace_with_working_monthly_sell(h: &Harness) -> moon_store::OrderRecord {
+    let mut s = h.store.lock().expect("lock");
+    let mut orig = s
+        .orders_between(ExecMode::Live, far_past(), far_future())
+        .expect("orders")
+        .remove(0);
+    let mut monthly = orig.clone();
+    monthly.id = Uuid::new_v4();
+    monthly.batch_id = Uuid::new_v4();
+    monthly.reason = OrderReason::Monthly;
+    monthly.limit_price = Some(dec!(9700));
+    monthly.broker_order_id = Some("fake-monthly".into());
+    monthly.status = OrderStatus::Sent;
+    s.insert_order(&monthly).expect("insert");
+    orig.status = OrderStatus::Cancelled;
+    s.update_order(&orig).expect("update");
+    monthly
+}
+
+#[tokio::test]
+async fn trip_with_an_unconfirmed_normal_sell_never_sends_a_second_sell() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    arm_breaker(&h);
+    h.engine.run_risk_check().await.expect("trip");
+    assert_eq!(h.fake().places().len(), 1);
+    // Make that stored order a working monthly sell whose cancel IOL never confirms.
+    let id = short_id(replace_with_working_monthly_sell(&h).id);
+    h.fake().set_cancel_confirms(false);
+    h.clock.advance(Duration::minutes(15));
+    h.engine.run_risk_check().await.expect("check");
+    h.clock.advance(Duration::minutes(15));
+    h.engine.run_risk_check().await.expect("check");
+    assert_eq!(h.fake().places().len(), 1, "{:?}", h.fake().places());
+    assert!(h.fake().cancels().len() >= 2, "the cancel is retried");
+    let waiting: Vec<String> = h
+        .notifier
+        .messages()
+        .into_iter()
+        .filter(|m| m.contains("espera") && m.contains(&id))
+        .collect();
+    assert_eq!(waiting.len(), 1, "{:?}", h.notifier.messages());
+}
+
+#[tokio::test]
+async fn emergency_refresh_failures_are_notified_hourly_and_escalate() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    arm_breaker(&h);
+    h.engine.run_risk_check().await.expect("trip");
+    let id = short_id(emergency_orders(&h)[0].id);
+    h.fake().set_fail_refresh(true);
+    let plain = format!("no se pudo consultar el estado de la orden {id} en IOL; se reintenta");
+    h.clock.advance(Duration::minutes(15));
+    h.engine.run_risk_check().await.expect("check 1");
+    assert_eq!(count_msgs(&h, &plain), 1, "{:?}", h.notifier.messages());
+    h.clock.advance(Duration::minutes(15));
+    h.engine.run_risk_check().await.expect("check 2");
+    assert_eq!(count_msgs(&h, &plain), 1, "deduplicated");
+    assert_eq!(count_msgs(&h, "considerá vender a mano"), 0);
+    h.clock.advance(Duration::minutes(15));
+    h.engine.run_risk_check().await.expect("check 3");
+    let esc: Vec<String> = h
+        .notifier
+        .messages()
+        .into_iter()
+        .filter(|m| m.contains("considerá vender a mano"))
+        .collect();
+    assert_eq!(esc.len(), 1, "{:?}", h.notifier.messages());
+    assert!(esc[0].contains(&id));
+    assert_eq!(h.fake().places().len(), 1, "never re-sent");
+    assert_eq!(emergency_orders(&h)[0].status, OrderStatus::Sent);
+}
+
+#[tokio::test]
+async fn emergency_market_order_left_pending_is_notified_hourly() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    arm_breaker(&h);
+    h.quotes
+        .set_at("AAA", Market::Bcba, clock_time() - Duration::minutes(45));
+    h.engine.run_risk_check().await.expect("trip");
+    assert_eq!(h.fake().places()[0].order_type, OrderType::Market);
+    let id = short_id(emergency_orders(&h)[0].id);
+    h.clock.advance(Duration::minutes(5));
+    h.engine.run_risk_check().await.expect("young");
+    assert_eq!(count_msgs(&h, "sigue sin ejecutarse"), 0);
+    h.clock.advance(Duration::minutes(10));
+    h.engine.run_risk_check().await.expect("old");
+    let n: Vec<String> = h
+        .notifier
+        .messages()
+        .into_iter()
+        .filter(|m| m.contains("sigue sin ejecutarse"))
+        .collect();
+    assert_eq!(n.len(), 1, "{:?}", h.notifier.messages());
+    assert!(n[0].contains(&id));
+    h.clock.advance(Duration::minutes(15));
+    h.engine.run_risk_check().await.expect("again");
+    assert_eq!(count_msgs(&h, "sigue sin ejecutarse"), 1, "hourly");
+    h.clock.advance(Duration::minutes(61));
+    h.engine.run_risk_check().await.expect("later");
+    assert_eq!(count_msgs(&h, "sigue sin ejecutarse"), 2);
+    assert_eq!(h.fake().places().len(), 1, "not re-sent");
+}
+
+#[tokio::test]
+async fn refuge_uses_cash_credited_in_parts() {
+    let h = refuge_harness_with(0, |_| {});
+    h.fake().set_fill_on_place(Some(Some(dec!(0))));
+    h.fake().set_cash_lag(true);
+    h.engine.run_risk_check().await.expect("trip");
+    assert_eq!(h.fake().places().len(), 1, "only the sell: no cash yet");
+
+    h.fake().release_pending_cash_part(dec!(0.6));
+    h.clock.advance(Duration::minutes(15));
+    h.engine.run_risk_check().await.expect("60 % credited");
+    let places = h.fake().places();
+    assert_eq!(places.len(), 2, "{places:?}");
+    assert_eq!(places[1].symbol, "REF");
+    assert_eq!(refuge_done(&h), None, "40 % is still not credited");
+
+    h.fake().release_pending_cash();
+    h.clock.advance(Duration::minutes(15));
+    h.engine.run_risk_check().await.expect("rest credited");
+    let places = h.fake().places();
+    assert_eq!(places.len(), 3, "{places:?}");
+    assert_eq!(places[2].symbol, "REF");
+    assert_eq!(places[2].side, Side::Buy);
+
+    h.clock.advance(Duration::minutes(15));
+    h.engine.run_risk_check().await.expect("settled");
+    assert_eq!(h.fake().places().len(), 3);
+    assert_eq!(refuge_done(&h), Some(TODAY));
+}
+
+#[tokio::test]
+async fn rejected_refuge_buy_notice_is_deduplicated_per_hour() {
+    let h = refuge_harness_with(0, |_| {});
+    h.fake().set_fill_on_place(Some(Some(dec!(0))));
+    h.fake().set_reject_buys(true);
+    h.engine.run_risk_check().await.expect("trip");
+    let rejected = |h: &Harness| count_msgs(h, "⚠️ Ejecución");
+    assert_eq!(rejected(&h), 1, "{:?}", h.notifier.messages());
+    h.clock.advance(Duration::minutes(15));
+    h.engine.run_risk_check().await.expect("retry");
+    assert_eq!(rejected(&h), 1, "deduplicated within the hour");
+    h.clock.advance(Duration::minutes(61));
+    h.engine.run_risk_check().await.expect("later");
+    assert_eq!(rejected(&h), 2);
+}
+
+#[tokio::test]
+async fn refuge_waiting_for_a_risky_holding_is_notified_once_per_day() {
+    let h = refuge_harness_with(0, |_| {});
+    h.fake().set_fill_on_place(Some(Some(dec!(0))));
+    h.fake().set_cash_lag(true);
+    h.engine.run_risk_check().await.expect("trip");
+    // A risky holding is still in the account, and its sell has an unknown outcome.
+    h.fake().set_fail_place(true);
+    h.fake().set_position("BBB", dec!(5));
+    h.clock.advance(Duration::minutes(15));
+    h.engine.run_risk_check().await.expect("check");
+    h.clock.advance(Duration::minutes(15));
+    h.engine.run_risk_check().await.expect("check");
+    let marker = "la compra del refugio espera";
+    assert_eq!(count_msgs(&h, marker), 1, "{:?}", h.notifier.messages());
+    h.clock.advance(Duration::days(1));
+    h.engine.run_risk_check().await.expect("next day");
+    assert_eq!(count_msgs(&h, marker), 2);
+}
+
+fn missing_notices(h: &Harness) -> usize {
+    count_msgs(h, "no aparece en IOL")
+}
+
+#[tokio::test]
+async fn missing_order_is_counted_per_check_and_only_when_old_enough() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    arm_breaker(&h);
+    h.quotes
+        .set_at("AAA", Market::Bcba, clock_time() - Duration::minutes(45));
+    h.engine.run_risk_check().await.expect("trip");
+    h.fake().set_not_listed(Some(Listing::NotListed));
+    // Younger than 10 minutes: never counted, however many checks.
+    for _ in 0..4 {
+        h.clock.advance(Duration::minutes(2));
+        h.engine.run_risk_check().await.expect("young");
+    }
+    assert_eq!(missing_notices(&h), 0);
+    // Old enough: one count per check (three checks, not three refreshes).
+    for _ in 0..2 {
+        h.clock.advance(Duration::minutes(15));
+        h.engine.run_risk_check().await.expect("check");
+    }
+    assert_eq!(missing_notices(&h), 0, "two checks are not enough");
+    h.clock.advance(Duration::minutes(15));
+    h.engine.run_risk_check().await.expect("third check");
+    assert_eq!(missing_notices(&h), 1, "{:?}", h.notifier.messages());
+}
+
+#[tokio::test]
+async fn not_listed_refresh_keeps_the_stored_progress() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    arm_breaker(&h);
+    h.engine.run_risk_check().await.expect("trip");
+    h.fake()
+        .set_refresh_result(progress(OrderStatus::PartiallyFilled, dec!(40), dec!(9800)));
+    h.clock.advance(Duration::minutes(1));
+    h.engine.run_risk_check().await.expect("partial fill");
+    let o = &emergency_orders(&h)[0];
+    assert_eq!(o.filled_qty, dec!(40));
+    h.fake().set_not_listed(Some(Listing::NotListed));
+    h.clock.advance(Duration::minutes(1));
+    h.engine.run_risk_check().await.expect("not listed");
+    let o = &emergency_orders(&h)[0];
+    assert_eq!(o.filled_qty, dec!(40));
+    assert_eq!(o.avg_fill_price, Some(dec!(9800)));
+    assert_eq!(o.status, OrderStatus::PartiallyFilled);
+}
+
+#[tokio::test]
+async fn rejected_batch_is_not_titled_completed() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    arm_breaker(&h);
+    h.fake().set_reject_place(true);
+    h.engine.run_risk_check().await.expect("trip");
+    assert_eq!(count_msgs(&h, "Ejecución completada"), 0);
+    assert_eq!(
+        count_msgs(&h, "⚠️ Ejecución"),
+        1,
+        "{:?}",
+        h.notifier.messages()
+    );
 }

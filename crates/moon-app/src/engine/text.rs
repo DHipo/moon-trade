@@ -118,17 +118,21 @@ pub(crate) fn execution_summary(reason: OrderReason, report: &ExecutionReport) -
             .as_deref()
             .is_some_and(|e| e.starts_with(UNKNOWN_OUTCOME))
     });
-    // Orders that were only sent are not "completed": they may still be working.
-    let only_sent = !report.orders.is_empty()
-        && report
-            .orders
-            .iter()
-            .all(|o| matches!(o.status, OrderStatus::Sent | OrderStatus::PendingSend));
+    // A rejected or failed order is never "completed"; orders that were only sent may still be
+    // working.
+    let problem = report
+        .orders
+        .iter()
+        .any(|o| matches!(o.status, OrderStatus::Rejected | OrderStatus::Failed));
+    let any_sent = report
+        .orders
+        .iter()
+        .any(|o| matches!(o.status, OrderStatus::Sent | OrderStatus::PendingSend));
     let head = if unknown {
         "🚨 Ejecución con resultado desconocido"
-    } else if !report.errors.is_empty() {
+    } else if !report.errors.is_empty() || problem {
         "⚠️ Ejecución con problemas"
-    } else if only_sent {
+    } else if any_sent {
         "📤 Órdenes enviadas"
     } else {
         "✅ Ejecución completada"

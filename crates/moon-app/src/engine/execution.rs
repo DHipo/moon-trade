@@ -48,8 +48,12 @@ pub(crate) enum EmergencyPricing {
     },
 }
 
-/// Consecutive refreshes in which IOL did not return an order before the owner is told.
-const MISSING_REFRESHES_BEFORE_NOTICE: u32 = 3;
+/// Consecutive checks in which IOL did not return an order before the owner is told.
+const MISSING_CHECKS_BEFORE_NOTICE: u32 = 3;
+/// An order younger than this is never counted as missing: IOL may be slow to list it.
+const MISSING_MIN_AGE_MINUTES: i64 = 10;
+/// Refreshes closer together than this belong to the same check and count once.
+const MISSING_MIN_SPACING_MINUTES: i64 = 5;
 
 struct SendOutcome {
     id: Uuid,
@@ -281,10 +285,20 @@ impl Engine {
             orders,
             errors,
         };
-        self.deps
-            .notifier
-            .notify(&execution_summary(reason, &report))
-            .await;
+        // A refuge buy that is only rejected again is retried at every check: tell it once an hour.
+        let repeated_rejection = exempt_daily_limit
+            && !report.orders.is_empty()
+            && report
+                .orders
+                .iter()
+                .all(|o| o.status == OrderStatus::Rejected)
+            && !self.notice_due("refuge_rejected_notice", chrono::Duration::hours(1));
+        if !repeated_rejection {
+            self.deps
+                .notifier
+                .notify(&execution_summary(reason, &report))
+                .await;
+        }
         Ok(report)
     }
 
@@ -607,8 +621,11 @@ impl Engine {
             .broker
             .refresh(&broker_id, &rec.symbol, art_date(rec.created_at))
             .await?;
-        self.apply_progress(rec, &progress);
-        self.db(|s| s.update_order(rec))?;
+        // A reply without the order says nothing about it: the stored progress stays.
+        if progress.listing == Listing::Listed {
+            self.apply_progress(rec, &progress);
+            self.db(|s| s.update_order(rec))?;
+        }
         self.track_listing(rec, progress.listing).await?;
         Ok(())
     }
@@ -647,20 +664,29 @@ impl Engine {
         Ok(())
     }
 
-    /// Counts the consecutive refreshes in which IOL did not return the order and warns the
+    /// Counts the consecutive CHECKS in which IOL did not return the order (refreshes within the
+    /// same check count once, and an order younger than ten minutes is not counted) and warns the
     /// owner (once per day) after three of them, or at once when IOL's list was truncated.
     async fn track_listing(&self, rec: &OrderRecord, listing: Listing) -> anyhow::Result<()> {
-        let key = self.state_key(&format!("order_missing:{}", rec.id));
+        type Counter = (u32, DateTime<Utc>);
+        let key = self.state_key(&format!("order_missing_checks:{}", rec.id));
+        let stored: Option<Counter> = self.db(|s| s.get_state(&key))?;
         if listing == Listing::Listed {
-            if self.db(|s| s.get_state::<u32>(&key))?.is_some() {
+            if stored.is_some() {
                 self.db(|s| s.delete_state(&key))?;
             }
             return Ok(());
         }
-        let missing = self.db(|s| s.get_state::<u32>(&key))?.unwrap_or(0) + 1;
-        self.db(|s| s.set_state(&key, &missing))?;
-        let due =
-            listing == Listing::NotListedTruncated || missing >= MISSING_REFRESHES_BEFORE_NOTICE;
+        let now = self.now();
+        let (mut missing, last) = stored.map_or((0, None), |(n, t)| (n, Some(t)));
+        let old_enough = now - rec.created_at >= chrono::Duration::minutes(MISSING_MIN_AGE_MINUTES);
+        let new_check =
+            last.is_none_or(|t| now - t >= chrono::Duration::minutes(MISSING_MIN_SPACING_MINUTES));
+        if old_enough && new_check {
+            missing += 1;
+            self.db(|s| s.set_state(&key, &(missing, now)))?;
+        }
+        let due = listing == Listing::NotListedTruncated || missing >= MISSING_CHECKS_BEFORE_NOTICE;
         if due
             && self.notice_due(
                 &format!("order_missing_notice:{}", rec.id),

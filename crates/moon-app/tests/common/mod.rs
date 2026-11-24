@@ -203,6 +203,16 @@ impl FakeBroker {
         a.cash_total_ars += amount;
     }
 
+    /// Credits only `part` (0..1) of the sell proceeds held back by the cash lag.
+    pub fn release_pending_cash_part(&self, part: Decimal) {
+        let mut pending = self.pending_cash.lock().expect("lock");
+        let amount = (*pending * part).round_dp(2);
+        *pending -= amount;
+        let mut a = self.account.lock().expect("lock");
+        a.cash_ars += amount;
+        a.cash_total_ars += amount;
+    }
+
     pub fn set_fail_refresh(&self, fail: bool) {
         *self.fail_refresh.lock().expect("lock") = fail;
     }

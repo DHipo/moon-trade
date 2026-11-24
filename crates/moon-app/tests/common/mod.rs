@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -9,8 +9,8 @@ use moon_app::config::{AppConfig, TradingMode};
 use moon_app::engine::{Engine, EngineDeps};
 use moon_app::notify::RecordingNotifier;
 use moon_broker::{
-    AccountState, Broker, BrokerError, ExternalFlow, OrderProgress, OrderTicket, PaperBroker,
-    PlaceResult, StaticQuotes,
+    AccountState, Broker, BrokerError, ExternalFlow, Listing, OrderProgress, OrderTicket,
+    PaperBroker, PlaceResult, StaticQuotes,
 };
 use moon_core::allocator::{AllocationConfig, SizingKind, StrategyConfig};
 use moon_core::asset::{Currency, Market, Role};
@@ -110,6 +110,23 @@ pub struct FakeBroker {
     /// `Some(n)`: an order fills completely on its n-th refresh and the account follows.
     fill_on_refresh: Mutex<Option<u32>>,
     refresh_counts: Mutex<BTreeMap<String, u32>>,
+    /// `cancel` returns an error (IOL did not confirm).
+    cancel_fails: Mutex<bool>,
+    /// A successful `cancel` makes the order show as cancelled on the next refresh (default).
+    cancel_confirms: Mutex<bool>,
+    cancelled: Mutex<BTreeSet<String>>,
+    /// Orders of this type are definitely rejected at placement.
+    reject_type: Mutex<Option<moon_core::types::OrderType>>,
+    /// `refresh` reports the order as missing from IOL's list.
+    not_listed: Mutex<Option<Listing>>,
+    fail_refresh: Mutex<bool>,
+    /// Fills at placement only apply to sells.
+    fill_only_sells: Mutex<bool>,
+    /// Sell proceeds are held back until `release_pending_cash` (settlement lag).
+    cash_lag: Mutex<bool>,
+    pending_cash: Mutex<Decimal>,
+    /// (broker order id, symbol) of every refresh call.
+    refreshes: Mutex<Vec<(String, String)>>,
 }
 
 impl FakeBroker {
@@ -129,6 +146,7 @@ impl FakeBroker {
                 filled_qty: Decimal::ZERO,
                 avg_price: None,
                 fees: None,
+                listing: Listing::Listed,
             }),
             flows: Mutex::new(Vec::new()),
             fail_place: Mutex::new(false),
@@ -139,7 +157,63 @@ impl FakeBroker {
             fill_on_place: Mutex::new(None),
             fill_on_refresh: Mutex::new(None),
             refresh_counts: Mutex::new(BTreeMap::new()),
+            cancel_fails: Mutex::new(false),
+            cancel_confirms: Mutex::new(true),
+            cancelled: Mutex::new(BTreeSet::new()),
+            reject_type: Mutex::new(None),
+            not_listed: Mutex::new(None),
+            fail_refresh: Mutex::new(false),
+            fill_only_sells: Mutex::new(false),
+            cash_lag: Mutex::new(false),
+            pending_cash: Mutex::new(Decimal::ZERO),
+            refreshes: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn set_cancel_fails(&self, fails: bool) {
+        *self.cancel_fails.lock().expect("lock") = fails;
+    }
+
+    /// `false`: `cancel` succeeds but the order keeps showing its previous state.
+    pub fn set_cancel_confirms(&self, confirms: bool) {
+        *self.cancel_confirms.lock().expect("lock") = confirms;
+    }
+
+    pub fn set_reject_type(&self, t: Option<moon_core::types::OrderType>) {
+        *self.reject_type.lock().expect("lock") = t;
+    }
+
+    pub fn set_not_listed(&self, l: Option<Listing>) {
+        *self.not_listed.lock().expect("lock") = l;
+    }
+
+    pub fn set_fill_only_sells(&self, only: bool) {
+        *self.fill_only_sells.lock().expect("lock") = only;
+    }
+
+    pub fn set_cash_lag(&self, lag: bool) {
+        *self.cash_lag.lock().expect("lock") = lag;
+    }
+
+    /// Credits the sell proceeds that were held back by the cash lag.
+    pub fn release_pending_cash(&self) {
+        let amount = std::mem::take(&mut *self.pending_cash.lock().expect("lock"));
+        let mut a = self.account.lock().expect("lock");
+        a.cash_ars += amount;
+        a.cash_total_ars += amount;
+    }
+
+    pub fn set_fail_refresh(&self, fail: bool) {
+        *self.fail_refresh.lock().expect("lock") = fail;
+    }
+
+    /// What every refresh reports (unless an order was cancelled or fills on refresh).
+    pub fn set_refresh_result(&self, progress: OrderProgress) {
+        *self.refresh_result.lock().expect("lock") = progress;
+    }
+
+    pub fn refreshes(&self) -> Vec<(String, String)> {
+        self.refreshes.lock().expect("lock").clone()
     }
 
     pub fn set_position(&self, symbol: &str, qty: Decimal) {
@@ -226,6 +300,7 @@ impl Broker for FakeBroker {
             return Err(BrokerError::Broker("timeout de red".into()));
         }
         if *self.reject_place.lock().expect("lock")
+            || *self.reject_type.lock().expect("lock") == Some(ticket.order_type)
             || (*self.reject_buys.lock().expect("lock")
                 && ticket.side == moon_core::types::Side::Buy)
         {
@@ -239,13 +314,20 @@ impl Broker for FakeBroker {
         let mut p = self.places.lock().expect("lock");
         p.push(ticket.clone());
         let mut fill = None;
-        if let Some(fees) = *self.fill_on_place.lock().expect("lock") {
+        let only_sells = *self.fill_only_sells.lock().expect("lock");
+        let fill_cfg = (*self.fill_on_place.lock().expect("lock"))
+            .filter(|_| !only_sells || ticket.side == moon_core::types::Side::Sell);
+        if let Some(fees) = fill_cfg {
             let price = ticket.limit_price.unwrap_or(dec!(10000));
             let value = ticket.qty * price;
             let mut a = self.account.lock().expect("lock");
             let held = a.positions.get(&ticket.symbol).copied().unwrap_or_default();
             let (new_held, cash) = match ticket.side {
                 moon_core::types::Side::Buy => (held + ticket.qty, a.cash_ars - value),
+                moon_core::types::Side::Sell if *self.cash_lag.lock().expect("lock") => {
+                    *self.pending_cash.lock().expect("lock") += value;
+                    (held - ticket.qty, a.cash_ars)
+                }
                 moon_core::types::Side::Sell => (held - ticket.qty, a.cash_ars + value),
             };
             a.cash_ars = cash;
@@ -257,6 +339,7 @@ impl Broker for FakeBroker {
                 filled_qty: ticket.qty,
                 avg_price: Some(price),
                 fees,
+                listing: Listing::Listed,
             });
         }
         Ok(PlaceResult {
@@ -270,8 +353,36 @@ impl Broker for FakeBroker {
     async fn refresh(
         &self,
         broker_order_id: &str,
+        symbol: &str,
         _placed_on: NaiveDate,
     ) -> Result<OrderProgress, BrokerError> {
+        self.refreshes
+            .lock()
+            .expect("lock")
+            .push((broker_order_id.to_string(), symbol.to_string()));
+        if *self.fail_refresh.lock().expect("lock") {
+            return Err(BrokerError::Broker("IOL no responde".into()));
+        }
+        if self
+            .cancelled
+            .lock()
+            .expect("lock")
+            .contains(broker_order_id)
+        {
+            // A cancelled order keeps whatever was filled before the cancel.
+            let mut p = self.refresh_result.lock().expect("lock").clone();
+            p.status = OrderStatus::Cancelled;
+            return Ok(p);
+        }
+        if let Some(listing) = *self.not_listed.lock().expect("lock") {
+            return Ok(OrderProgress {
+                status: OrderStatus::Sent,
+                filled_qty: Decimal::ZERO,
+                avg_price: None,
+                fees: None,
+                listing,
+            });
+        }
         let threshold = *self.fill_on_refresh.lock().expect("lock");
         if let Some(n) = threshold {
             let count = {
@@ -305,6 +416,7 @@ impl Broker for FakeBroker {
                     filled_qty: t.qty,
                     avg_price: Some(price),
                     fees: None,
+                    listing: Listing::Listed,
                 });
             }
         }
@@ -316,6 +428,17 @@ impl Broker for FakeBroker {
             .lock()
             .expect("lock")
             .push(broker_order_id.to_string());
+        if *self.cancel_fails.lock().expect("lock") {
+            return Err(BrokerError::Broker(
+                "IOL no confirmó la cancelación de la orden".into(),
+            ));
+        }
+        if *self.cancel_confirms.lock().expect("lock") {
+            self.cancelled
+                .lock()
+                .expect("lock")
+                .insert(broker_order_id.to_string());
+        }
         Ok(())
     }
 

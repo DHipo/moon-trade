@@ -39,6 +39,10 @@ pub struct ExecutionConfig {
     /// Emergency sells are limit orders this far below the last price (fraction, 0.03 = 3 %).
     #[serde(default = "default_emergency_limit_discount")]
     pub emergency_limit_discount: Decimal,
+    /// After a market emergency sell is definitely rejected, the next attempt is a limit order this
+    /// far below the last known price, even if that quote is stale (fraction, `(0, 0.5]`).
+    #[serde(default = "default_emergency_deep_limit_discount")]
+    pub emergency_deep_limit_discount: Decimal,
     /// An emergency limit order that is still unfilled after this many minutes is cancelled and
     /// re-sent at market (1..=60).
     #[serde(default = "default_emergency_reprice_minutes")]
@@ -58,6 +62,10 @@ pub struct ExecutionConfig {
 
 fn default_emergency_limit_discount() -> Decimal {
     Decimal::new(3, 2)
+}
+
+fn default_emergency_deep_limit_discount() -> Decimal {
+    Decimal::new(10, 2)
 }
 
 fn default_emergency_reprice_minutes() -> u32 {
@@ -204,6 +212,11 @@ impl AppConfig {
             || self.execution.emergency_limit_discount > Decimal::new(2, 1)
         {
             bail!("execution.emergency_limit_discount debe estar entre 0 y 0.2");
+        }
+        if self.execution.emergency_deep_limit_discount <= Decimal::ZERO
+            || self.execution.emergency_deep_limit_discount > Decimal::new(5, 1)
+        {
+            bail!("execution.emergency_deep_limit_discount debe estar entre 0 (excluido) y 0.5");
         }
         if !(1..=60).contains(&self.execution.emergency_reprice_minutes) {
             bail!("execution.emergency_reprice_minutes debe estar entre 1 y 60");

@@ -224,6 +224,21 @@ fn cash_refuge_warning_depends_on_the_cash_return() {
 }
 
 #[test]
+fn emergency_deep_limit_discount_defaults_and_is_validated() {
+    let mut cfg = example();
+    assert_eq!(cfg.execution.emergency_deep_limit_discount, dec!(0.10));
+    cfg.execution.emergency_deep_limit_discount = dec!(0.5);
+    cfg.validate().expect("valid");
+    cfg.execution.emergency_deep_limit_discount = dec!(0.01);
+    cfg.validate().expect("valid");
+    for bad in [dec!(0), dec!(-0.1), dec!(0.51)] {
+        cfg.execution.emergency_deep_limit_discount = bad;
+        let err = cfg.validate().expect_err("invalid").to_string();
+        assert!(err.contains("emergency_deep_limit_discount"), "{err}");
+    }
+}
+
+#[test]
 fn emergency_reprice_and_wait_have_defaults_and_are_validated() {
     let mut cfg = example();
     assert_eq!(cfg.execution.emergency_reprice_minutes, 10);

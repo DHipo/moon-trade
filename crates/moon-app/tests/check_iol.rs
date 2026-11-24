@@ -22,6 +22,11 @@ async fn mount(server: &MockServer, verb: &str, p: &str, data: Value) {
 }
 
 async fn mock_iol() -> MockServer {
+    mock_iol_at(None).await
+}
+
+/// Like [`mock_iol`], with `last_updated` on the BCBA quotes.
+async fn mock_iol_at(last_updated: Option<&str>) -> MockServer {
     let server = MockServer::start().await;
     let expires =
         (Utc::now() + Duration::minutes(15)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -87,7 +92,7 @@ async fn mock_iol() -> MockServer {
         .and(query_param("market", "BCBA"))
         .respond_with(ResponseTemplate::new(200).set_body_json(envelope(json!({
             "symbol": "X", "market": "BCBA", "currency": "ARS",
-            "prices": {"current": 12000.0}
+            "prices": {"current": 12000.0}, "last_updated": last_updated
         }))))
         .mount(&server)
         .await;
@@ -182,4 +187,43 @@ async fn check_iol_needs_credentials() {
         .await
         .expect_err("no creds");
     assert!(err.to_string().contains("MOON_IOL_USERNAME"));
+}
+
+#[tokio::test]
+async fn check_iol_shows_the_quote_time_and_freshness() {
+    // Without `last_updated`: shown as absent and not fresh.
+    let server = mock_iol().await;
+    let mut cfg = AppConfig::load(Path::new("../../moon.example.toml")).expect("example");
+    cfg.iol.base_url = server.uri();
+    let out = check_iol(&cfg, &secrets()).await.expect("report");
+    assert!(out.contains("last_updated crudo (ausente)"), "{out}");
+    assert!(
+        out.contains("NO fresca (last_updated ausente o ilegible)"),
+        "{out}"
+    );
+
+    // A stamp from now in dd/mm/yyyy format (ART is UTC-3): read and fresh.
+    let raw = (Utc::now() - Duration::hours(3))
+        .format("%d/%m/%Y %H:%M:%S")
+        .to_string();
+    let server = mock_iol_at(Some(&raw)).await;
+    cfg.iol.base_url = server.uri();
+    let out = check_iol(&cfg, &secrets()).await.expect("report");
+    assert!(
+        out.contains(&format!("last_updated crudo «{raw}»")),
+        "{out}"
+    );
+    assert!(out.contains("ART"), "{out}");
+    assert!(out.contains("· fresca"), "{out}");
+
+    // An old stamp is read but not fresh; an unreadable one is flagged.
+    let server = mock_iol_at(Some("2020-01-02T10:00:00")).await;
+    cfg.iol.base_url = server.uri();
+    let out = check_iol(&cfg, &secrets()).await.expect("report");
+    assert!(out.contains("2020-01-02 10:00:00 ART"), "{out}");
+    assert!(out.contains("NO fresca (tiene"), "{out}");
+    let server = mock_iol_at(Some("anteayer")).await;
+    cfg.iol.base_url = server.uri();
+    let out = check_iol(&cfg, &secrets()).await.expect("report");
+    assert!(out.contains("interpretado no se pudo interpretar"), "{out}");
 }

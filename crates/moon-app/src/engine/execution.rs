@@ -2,10 +2,11 @@
 
 use std::time::{Duration, Instant};
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, bail};
-use moon_broker::{OrderProgress, OrderTicket};
+use chrono::{DateTime, Utc};
+use moon_broker::{Listing, OrderProgress, OrderTicket};
 use moon_core::asset::AssetId;
 use moon_core::money::{floor_to_lot, round_money, round_price};
 use moon_core::rebalance::{PlannedOrder, RebalancePlan};
@@ -37,6 +38,19 @@ pub fn floor_to_tick(price: Decimal, tick: Decimal) -> Decimal {
     round_price((price / tick).floor() * tick)
 }
 
+/// How one emergency sell is priced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmergencyPricing {
+    Market,
+    /// Limit order this fraction below the reference price.
+    Limit {
+        discount: Decimal,
+    },
+}
+
+/// Consecutive refreshes in which IOL did not return an order before the owner is told.
+const MISSING_REFRESHES_BEFORE_NOTICE: u32 = 3;
+
 struct SendOutcome {
     id: Uuid,
     /// Set when the batch must stop (unknown outcome or a previously unknown order).
@@ -60,6 +74,28 @@ impl Engine {
             .await
     }
 
+    /// Emergency exit with an explicit pricing per asset (limit with a discount, or market).
+    /// Assets without an entry use the configured emergency limit when a reference price exists.
+    pub(crate) async fn execute_emergency(
+        &self,
+        plan: &RebalancePlan,
+        targets: &TargetWeights,
+        batch_id: Uuid,
+        pricing: &BTreeMap<AssetId, EmergencyPricing>,
+    ) -> anyhow::Result<ExecutionReport> {
+        self.execute_inner(
+            plan,
+            targets,
+            OrderReason::Emergency,
+            batch_id,
+            true,
+            &BTreeSet::new(),
+            false,
+            pricing,
+        )
+        .await
+    }
+
     /// Like [`Engine::execute`], never trading the `excluded` assets (they already have a working
     /// order or an order with unknown outcome): neither the plan's orders nor the buys that are
     /// recomputed from real cash include them.
@@ -72,8 +108,17 @@ impl Engine {
         emergency: bool,
         excluded: &BTreeSet<AssetId>,
     ) -> anyhow::Result<ExecutionReport> {
-        self.execute_inner(plan, targets, reason, batch_id, emergency, excluded, false)
-            .await
+        self.execute_inner(
+            plan,
+            targets,
+            reason,
+            batch_id,
+            emergency,
+            excluded,
+            false,
+            &BTreeMap::new(),
+        )
+        .await
     }
 
     /// Buys the refuge after an emergency exit: the normal tranche splitting applies, but the
@@ -93,6 +138,7 @@ impl Engine {
             false,
             &BTreeSet::new(),
             true,
+            &BTreeMap::new(),
         )
         .await
     }
@@ -107,6 +153,7 @@ impl Engine {
         emergency: bool,
         excluded: &BTreeSet<AssetId>,
         exempt_daily_limit: bool,
+        pricing: &BTreeMap<AssetId, EmergencyPricing>,
     ) -> anyhow::Result<ExecutionReport> {
         let max_orders_per_day = if exempt_daily_limit {
             u32::MAX
@@ -169,7 +216,14 @@ impl Engine {
             .collect();
         for (order, tranche) in sells {
             let out = self
-                .send_order(order, *tranche, reason, batch_id, emergency)
+                .send_order(
+                    order,
+                    *tranche,
+                    reason,
+                    batch_id,
+                    emergency,
+                    pricing.get(&order.asset).copied(),
+                )
                 .await?;
             ids.push(out.id);
             if let Some(msg) = out.halt {
@@ -202,7 +256,7 @@ impl Engine {
                             continue;
                         }
                         let out = self
-                            .send_order(order, *tranche, reason, batch_id, emergency)
+                            .send_order(order, *tranche, reason, batch_id, emergency, None)
                             .await?;
                         ids.push(out.id);
                         if let Some(msg) = out.halt {
@@ -394,6 +448,7 @@ impl Engine {
         reason: OrderReason,
         batch_id: Uuid,
         emergency: bool,
+        pricing: Option<EmergencyPricing>,
     ) -> anyhow::Result<SendOutcome> {
         let exec = self
             .universe
@@ -402,24 +457,35 @@ impl Engine {
             .ok_or_else(|| anyhow!("{} no es operable", order.asset))?;
         let id = order_id_for_tranche(batch_id, &order.asset, order.side, tranche);
         let now = self.now();
-        // Emergency sells: an aggressive limit (below the last price by the configured discount)
-        // when a fresh quote is known, otherwise at market; the priority is getting out.
-        let order_type = if emergency && order.ref_price <= Decimal::ZERO {
-            OrderType::Market
-        } else if emergency {
-            OrderType::Limit
+        // Emergency sells go at market unless the caller chose a limit discount (the default,
+        // without an explicit choice, is the configured emergency discount); a limit needs a
+        // reference price. The priority is getting out.
+        let emergency_discount = if emergency && order.ref_price > Decimal::ZERO {
+            match pricing {
+                Some(EmergencyPricing::Market) => None,
+                Some(EmergencyPricing::Limit { discount }) => Some(discount),
+                None => Some(self.cfg.execution.emergency_limit_discount),
+            }
+        } else {
+            None
+        };
+        let order_type = if emergency {
+            if emergency_discount.is_some() {
+                OrderType::Limit
+            } else {
+                OrderType::Market
+            }
         } else {
             self.cfg.execution.order_type
         };
-        let limit_price = match order_type {
-            OrderType::Market => None,
-            OrderType::Limit if emergency => {
+        let limit_price = match (order_type, emergency_discount) {
+            (OrderType::Market, _) => None,
+            (OrderType::Limit, Some(discount)) => {
                 let tick = self.cfg.execution.price_tick;
-                let discount = self.cfg.execution.emergency_limit_discount;
                 let p = floor_to_tick(order.ref_price * (Decimal::ONE - discount), tick);
                 Some(if p > Decimal::ZERO { p } else { tick })
             }
-            OrderType::Limit => Some(self.limit_price_for(order.side, order.ref_price)),
+            (OrderType::Limit, None) => Some(self.limit_price_for(order.side, order.ref_price)),
         };
         let mut rec = OrderRecord {
             id,
@@ -530,7 +596,8 @@ impl Engine {
         }
     }
 
-    /// Refreshes one order from the broker and stores the result.
+    /// Refreshes one order from the broker and stores the result. The symbol comes from the
+    /// persisted record, so it survives restarts.
     pub(crate) async fn refresh_order(&self, rec: &mut OrderRecord) -> anyhow::Result<()> {
         let Some(broker_id) = rec.broker_order_id.clone() else {
             return Ok(());
@@ -538,11 +605,99 @@ impl Engine {
         let progress = self
             .deps
             .broker
-            .refresh(&broker_id, art_date(rec.created_at))
+            .refresh(&broker_id, &rec.symbol, art_date(rec.created_at))
             .await?;
         self.apply_progress(rec, &progress);
         self.db(|s| s.update_order(rec))?;
+        self.track_listing(rec, progress.listing).await?;
         Ok(())
+    }
+
+    /// Refreshes an emergency order and tells the owner about any new fill.
+    pub(crate) async fn refresh_emergency_order(
+        &self,
+        rec: &mut OrderRecord,
+    ) -> anyhow::Result<()> {
+        let before = rec.filled_qty;
+        self.refresh_order(rec).await?;
+        if rec.filled_qty > before {
+            let what = match rec.side {
+                Side::Sell => "Venta de emergencia ejecutada",
+                Side::Buy => "Compra de emergencia ejecutada",
+            };
+            let price = rec
+                .avg_fill_price
+                .map_or_else(String::new, |p| format!(" a ARS {}", p.round_dp(4)));
+            let partial = if rec.filled_qty < rec.qty {
+                " (parcial)"
+            } else {
+                ""
+            };
+            self.deps
+                .notifier
+                .notify(&format!(
+                    "✅ {what}: {} {} de {}{price}{partial} (orden {}).",
+                    rec.symbol,
+                    rec.filled_qty,
+                    rec.qty,
+                    super::text::short_id(rec.id)
+                ))
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Counts the consecutive refreshes in which IOL did not return the order and warns the
+    /// owner (once per day) after three of them, or at once when IOL's list was truncated.
+    async fn track_listing(&self, rec: &OrderRecord, listing: Listing) -> anyhow::Result<()> {
+        let key = self.state_key(&format!("order_missing:{}", rec.id));
+        if listing == Listing::Listed {
+            if self.db(|s| s.get_state::<u32>(&key))?.is_some() {
+                self.db(|s| s.delete_state(&key))?;
+            }
+            return Ok(());
+        }
+        let missing = self.db(|s| s.get_state::<u32>(&key))?.unwrap_or(0) + 1;
+        self.db(|s| s.set_state(&key, &missing))?;
+        let due =
+            listing == Listing::NotListedTruncated || missing >= MISSING_REFRESHES_BEFORE_NOTICE;
+        if due
+            && self.notice_due(
+                &format!("order_missing_notice:{}", rec.id),
+                chrono::Duration::days(1),
+            )
+        {
+            let id = super::text::short_id(rec.id);
+            self.deps
+                .notifier
+                .notify(&format!(
+                    "⚠️ La orden {id} de {} {} no aparece en IOL{}: verificá en IOL y usá `moon orders resolve {id}` si ya no existe o su resultado es otro.",
+                    super::text::side_es(rec.side),
+                    rec.symbol,
+                    if listing == Listing::NotListedTruncated {
+                        " (la lista de IOL vino truncada)"
+                    } else {
+                        ""
+                    }
+                ))
+                .await;
+        }
+        Ok(())
+    }
+
+    /// True when the notice `name` was not sent in the last `every`; records it as sent now.
+    /// Keys are per mode. A failure to persist only risks a repeated notice.
+    pub(crate) fn notice_due(&self, name: &str, every: chrono::Duration) -> bool {
+        let key = self.state_key(name);
+        let now: DateTime<Utc> = self.now();
+        let last: Option<DateTime<Utc>> = self.db(|s| s.get_state(&key)).ok().flatten();
+        if last.is_some_and(|t| now - t < every) {
+            return false;
+        }
+        if let Err(e) = self.db(|s| s.set_state(&key, &now)) {
+            tracing::warn!("no se pudo guardar el aviso {name}: {e}");
+        }
+        true
     }
 
     /// Polls the orders until they are terminal or `fill_timeout_minutes` elapsed (real time).

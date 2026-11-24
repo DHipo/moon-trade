@@ -11,7 +11,7 @@ use moon_core::money::{floor_to_lot, round_money};
 use moon_core::nav::NavTracker;
 use moon_core::rebalance::{PlannedOrder, RebalancePlan};
 use moon_core::risk::{DrawdownSignal, DrawdownState};
-use moon_core::risk_index::RiskIndex;
+use moon_core::risk_index::{AnomalyKind, RiskIndex};
 use moon_core::time::{ART, art_datetime};
 use moon_core::types::{DataSource, ExecMode, OrderReason, OrderStatus, Side};
 use moon_core::weights::TargetWeights;
@@ -29,8 +29,8 @@ use super::text::{execution_summary, proposal_text};
 use super::{
     Engine, ExecutionReport, MonthlyAttempt, MonthlyOutcome, ORDER_BLOCKED, RiskOutcome,
     STATE_DEPOSIT_PENDING, STATE_DRAWDOWN, STATE_EMERGENCY_REFUGE, STATE_EMERGENCY_UNKNOWN,
-    STATE_FLOWS_CHECKED, STATE_MONTHLY_ATTEMPT, STATE_NAV, STATE_PAPER_INIT, STATE_RISK_INDEX,
-    UNKNOWN_OUTCOME, Valuation, art_day_bounds, last_day_of_previous_month,
+    STATE_FLOWS_CHECKED, STATE_MONTHLY_ATTEMPT, STATE_NAV, STATE_PAPER_INIT, STATE_RISK_ACCEPT,
+    STATE_RISK_INDEX, UNKNOWN_OUTCOME, Valuation, art_day_bounds, last_day_of_previous_month,
 };
 use crate::commands::data::fetch_update;
 use crate::config::TradingMode;
@@ -313,6 +313,10 @@ impl Engine {
     ) -> anyhow::Result<()> {
         let reset = drawdown.monthly_decision(level);
         self.save_drawdown(drawdown)?;
+        // The monthly was executed or proposed with the cash in the account: deposits detected
+        // before it must not trigger a second proposal for the same cash.
+        let pending = self.state_key(STATE_DEPOSIT_PENDING);
+        self.db(|s| s.delete_state(&pending))?;
         if reset {
             let (refuge, unknown) = (
                 self.state_key(STATE_EMERGENCY_REFUGE),
@@ -339,9 +343,18 @@ impl Engine {
             .iter()
             .map(|p| (p.symbol.clone(), p.price_ars / v.ccl))
             .collect();
+        // Acceptances the owner requested (Telegram or CLI) apply to this observation.
+        let accept_key = self.state_key(STATE_RISK_ACCEPT);
+        let accepted: Vec<String> = self.db(|s| s.get_state(&accept_key))?.unwrap_or_default();
+        for sym in &accepted {
+            index.accept(sym);
+        }
         let r = index
             .observe(&holdings, &prices, v.at)
             .map_err(|e| anyhow!("no se pudo actualizar el índice de riesgo: {e}"))?;
+        if !accepted.is_empty() {
+            self.db(|s| s.delete_state(&accept_key))?;
+        }
         // Each anomaly is announced once per symbol and kind per day.
         let today = self.today();
         for a in &index.anomalies {
@@ -351,13 +364,21 @@ impl Engine {
                 continue;
             }
             self.db(|s| s.set_state(&key, &today))?;
-            self.deps
-                .notifier
-                .notify(&format!(
+            let text = match a.kind {
+                AnomalyKind::SuspectedRatioChange => format!(
+                    "⚠️ Índice de riesgo: posible cambio de ratio en {sym} ({detail}). No se cuenta como caída hasta que IOL actualice la tenencia o lo aceptes con /aceptar {sym}.",
+                    sym = a.symbol,
+                    detail = a.detail
+                ),
+                AnomalyKind::CorporateAction => format!(
                     "⚠️ Índice de riesgo: {} — {}. No cuenta como caída de mercado.",
                     a.symbol, a.detail
-                ))
-                .await;
+                ),
+                AnomalyKind::AcceptedByOwner => {
+                    format!("⚠️ Índice de riesgo: {} — {}.", a.symbol, a.detail)
+                }
+            };
+            self.deps.notifier.notify(&text).await;
         }
         Ok(r)
     }

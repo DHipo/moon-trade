@@ -64,6 +64,35 @@ pub const STATE_EMERGENCY_REFUGE: &str = "emergency_refuge_done";
 /// Per asset, the last day the user was warned about an emergency order with unknown outcome.
 pub const STATE_EMERGENCY_UNKNOWN: &str = "emergency_unknown_notified";
 
+/// Symbols whose pending suspected ratio change the owner accepted; the next risk check applies
+/// them to the risk index (a separate key, so the CLI never races the service on the index).
+pub const STATE_RISK_ACCEPT: &str = "risk_accept";
+
+/// Records the owner's acceptance of the pending suspected ratio change of `symbol`: the next
+/// risk check counts the move from the kept base as real. Fails when nothing is pending for it.
+pub fn request_ratio_accept(
+    store: &mut Store,
+    mode: ExecMode,
+    symbol: &str,
+) -> anyhow::Result<String> {
+    let symbol = symbol.trim().to_uppercase();
+    if symbol.is_empty() {
+        bail!("Indicá el símbolo: por ejemplo `/aceptar AAPL`.");
+    }
+    let index: Option<RiskIndex> =
+        store.get_state(&format!("{STATE_RISK_INDEX}:{}", mode.as_str()))?;
+    if !index.is_some_and(|i| i.suspicions.contains_key(&symbol)) {
+        bail!("No hay un posible cambio de ratio pendiente en {symbol}.");
+    }
+    let key = format!("{STATE_RISK_ACCEPT}:{}", mode.as_str());
+    let mut accepted: Vec<String> = store.get_state(&key)?.unwrap_or_default();
+    if !accepted.contains(&symbol) {
+        accepted.push(symbol.clone());
+    }
+    store.set_state(&key, &accepted)?;
+    Ok(symbol)
+}
+
 /// Start of the error raised when the order limits block an execution.
 pub(crate) const ORDER_BLOCKED: &str = "Orden bloqueada por los límites de riesgo";
 
@@ -296,6 +325,16 @@ impl Engine {
     }
 
     /// The risk index of this mode; a fresh one (level 1.0) when there is none yet.
+    /// Owner acceptance of a pending suspected ratio change (see [`request_ratio_accept`]).
+    pub fn accept_ratio_change(&self, symbol: &str) -> anyhow::Result<String> {
+        let mut guard = self
+            .deps
+            .store
+            .lock()
+            .map_err(|_| anyhow!("la base de datos quedó en un estado inconsistente"))?;
+        request_ratio_accept(&mut guard, self.exec_mode(), symbol)
+    }
+
     pub(crate) fn load_risk_index(&self) -> anyhow::Result<RiskIndex> {
         let key = self.state_key(STATE_RISK_INDEX);
         Ok(self

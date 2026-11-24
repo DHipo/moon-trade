@@ -123,8 +123,8 @@ pub fn resolve_order(
 /// Minimum length of an order id prefix accepted by `moon orders resolve`.
 const MIN_PREFIX_LEN: usize = 6;
 
-/// Finds the order whose id is `input` (full UUID) or the unique order starting with it.
-pub fn find_order_id(store: &Store, input: &str) -> anyhow::Result<Uuid> {
+/// Finds the order whose id is `input` (full UUID) or the unique order of `mode` starting with it.
+pub fn find_order_id(store: &Store, mode: ExecMode, input: &str) -> anyhow::Result<Uuid> {
     let input = input.trim();
     if let Ok(id) = Uuid::parse_str(input) {
         return Ok(id);
@@ -134,7 +134,7 @@ pub fn find_order_id(store: &Store, input: &str) -> anyhow::Result<Uuid> {
             "El identificador debe tener al menos {MIN_PREFIX_LEN} caracteres (usá el que muestra `moon orders list`)."
         );
     }
-    let candidates = store.orders_by_id_prefix(input)?;
+    let candidates = store.orders_by_id_prefix(mode, input)?;
     match candidates.as_slice() {
         [] => bail!("No existe ninguna orden cuyo identificador empiece con «{input}»."),
         [one] => Ok(one.id),
@@ -170,12 +170,16 @@ pub fn list_text(store: &Store, mode: ExecMode, unknown_only: bool) -> anyhow::R
 /// CLI entry of `moon orders list`: read-only.
 pub fn run_list(cfg: &AppConfig, unknown_only: bool) -> anyhow::Result<()> {
     let store = Store::open(&cfg.database_path)?;
-    let mode = match cfg.mode {
+    println!("{}", list_text(&store, exec_mode(cfg), unknown_only)?);
+    Ok(())
+}
+
+/// Execution mode (paper or live) of the configured trading mode.
+pub fn exec_mode(cfg: &AppConfig) -> ExecMode {
+    match cfg.mode {
         TradingMode::Paper => ExecMode::Paper,
         TradingMode::LiveConfirm | TradingMode::LiveAuto => ExecMode::Live,
-    };
-    println!("{}", list_text(&store, mode, unknown_only)?);
-    Ok(())
+    }
 }
 
 /// CLI entry: opens the database of the configuration and resolves the order. Never calls IOL.
@@ -187,7 +191,7 @@ pub fn run_resolve(
     price: Option<Decimal>,
 ) -> anyhow::Result<()> {
     let mut store = Store::open(&cfg.database_path)?;
-    let id = find_order_id(&store, id)?;
+    let id = find_order_id(&store, exec_mode(cfg), id)?;
     let msg = resolve_order(&mut store, &cfg.fees, Utc::now(), id, outcome, qty, price)?;
     println!("{msg}");
     Ok(())

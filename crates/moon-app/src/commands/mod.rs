@@ -6,6 +6,7 @@ pub mod orders;
 pub mod paper;
 pub mod pause;
 pub mod plan;
+pub mod risk;
 pub mod status;
 
 use std::sync::{Arc, Mutex};

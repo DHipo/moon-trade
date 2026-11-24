@@ -11,7 +11,7 @@ pub mod scheduler;
 pub mod serve;
 pub mod telegram_bot;
 
-use cli::{CheckCmd, Cli, Command, DataCmd, OrdersCmd, PaperCmd};
+use cli::{CheckCmd, Cli, Command, DataCmd, OrdersCmd, PaperCmd, RiskCmd};
 use config::{AppConfig, load_secrets};
 
 pub async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -71,6 +71,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             let cfg = AppConfig::load(&cli.config)?;
             commands::orders::run_list(&cfg, unknown)
+        }
+        Command::Risk {
+            cmd: RiskCmd::Accept { symbol },
+        } => {
+            let cfg = AppConfig::load(&cli.config)?;
+            commands::risk::run_accept(&cfg, &symbol)
         }
         Command::Pause => {
             let cfg = AppConfig::load(&cli.config)?;

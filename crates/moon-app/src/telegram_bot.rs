@@ -21,12 +21,13 @@ const HELP: &str = "Comandos disponibles:\n\
 /estado: patrimonio, posiciones y estado del bot\n\
 /pausa: frena los rebalanceos (las salidas de emergencia siguen activas)\n\
 /reanudar: reanuda los rebalanceos\n\
+/aceptar <símbolo>: cuenta como movimiento real un posible cambio de ratio pendiente\n\
 /ayuda: muestra esta ayuda";
 
 pub async fn handle_incoming(engine: &Engine, incoming: &Incoming) -> BotAction {
     match &incoming.kind {
-        IncomingKind::Command { name, .. } => {
-            BotAction::Reply(handle_command(engine, &name.to_lowercase()).await)
+        IncomingKind::Command { name, args } => {
+            BotAction::Reply(handle_command(engine, &name.to_lowercase(), args).await)
         }
         IncomingKind::Callback {
             id,
@@ -44,7 +45,7 @@ pub async fn handle_incoming(engine: &Engine, incoming: &Incoming) -> BotAction 
     }
 }
 
-async fn handle_command(engine: &Engine, name: &str) -> String {
+async fn handle_command(engine: &Engine, name: &str, args: &str) -> String {
     match name {
         "estado" | "status" => engine
             .status_text()
@@ -60,7 +61,32 @@ async fn handle_command(engine: &Engine, name: &str) -> String {
             Ok(()) => "▶️ Bot reanudado.".to_string(),
             Err(e) => format!("No se pudo reanudar: {e}"),
         },
+        "aceptar" | "accept" => accept_ratio(engine, args).await,
         _ => HELP.to_string(),
+    }
+}
+
+/// `/aceptar <símbolo>`: the pending suspected ratio change counts as a real move; the risk
+/// check runs right away so the breaker sees it.
+async fn accept_ratio(engine: &Engine, args: &str) -> String {
+    let symbol = match engine.accept_ratio_change(args) {
+        Ok(symbol) => symbol,
+        Err(e) => return format!("No se pudo aceptar: {e}"),
+    };
+    match engine.run_risk_check().await {
+        Ok(out) => format!(
+            "✅ Aceptado: el movimiento de {symbol} se cuenta como real. Índice de riesgo {:.4}, caída {:.1}%{}.",
+            out.level,
+            out.drawdown * 100.0,
+            if out.tripped {
+                " · FRENO ACTIVADO"
+            } else {
+                ""
+            }
+        ),
+        Err(e) => format!(
+            "Aceptado: {symbol} se cuenta como movimiento real en el próximo control de riesgo (el control inmediato falló: {e})."
+        ),
     }
 }
 

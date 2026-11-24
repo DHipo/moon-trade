@@ -1,9 +1,12 @@
 mod common;
 
-use common::{Harness, TODAY};
+use std::collections::BTreeMap;
+
+use common::{Harness, TODAY, clock_time};
 use moon_app::config::TradingMode;
-use moon_app::engine::MonthlyOutcome;
+use moon_app::engine::{MonthlyOutcome, STATE_RISK_INDEX};
 use moon_app::telegram_bot::{BotAction, handle_incoming};
+use moon_core::risk_index::RiskIndex;
 use moon_telegram::{Incoming, IncomingKind};
 use rust_decimal_macros::dec;
 
@@ -51,6 +54,56 @@ async fn pausa_and_reanudar_toggle_state() {
         panic!("expected help");
     };
     assert!(help.contains("/estado") && help.contains("/pausa") && help.contains("/reanudar"));
+}
+
+fn command_with(name: &str, args: &str) -> Incoming {
+    Incoming {
+        update_id: 3,
+        kind: IncomingKind::Command {
+            name: name.into(),
+            args: args.into(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn aceptar_accepts_a_pending_ratio_change_and_reports_errors() {
+    let h = Harness::live(TradingMode::LiveAuto, dec!(0));
+    h.fake().set_position("AAA", dec!(100));
+    let index = RiskIndex {
+        level: 1.0,
+        holdings: BTreeMap::from([("AAA".to_string(), dec!(100))]),
+        prices_usd: BTreeMap::from([("AAA".to_string(), dec!(20000) / dec!(1200))]),
+        at: Some(clock_time()),
+        suspicions: BTreeMap::from([("AAA".to_string(), 1)]),
+        ..RiskIndex::default()
+    };
+    let key = h.engine.state_key(STATE_RISK_INDEX);
+    h.store
+        .lock()
+        .expect("lock")
+        .set_state(&key, &index)
+        .expect("index");
+
+    let BotAction::Reply(none) = handle_incoming(&h.engine, &command_with("aceptar", "")).await
+    else {
+        panic!("expected a reply");
+    };
+    assert!(none.contains("No se pudo aceptar"), "{none}");
+    let BotAction::Reply(wrong) = handle_incoming(&h.engine, &command_with("aceptar", "ZZZ")).await
+    else {
+        panic!("expected a reply");
+    };
+    assert!(wrong.contains("No hay un posible cambio"), "{wrong}");
+    let BotAction::Reply(ok) = handle_incoming(&h.engine, &command_with("aceptar", "aaa")).await
+    else {
+        panic!("expected a reply");
+    };
+    assert!(ok.contains("Aceptado") && ok.contains("AAA"), "{ok}");
+    // The risk check ran right away and counted the (halved) price as a real move.
+    assert!(ok.contains("0.5000"), "{ok}");
+    let help = handle_incoming(&h.engine, &command("ayuda")).await;
+    assert!(matches!(help, BotAction::Reply(t) if t.contains("/aceptar")));
 }
 
 #[tokio::test]

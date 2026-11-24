@@ -52,6 +52,11 @@ pub enum Command {
         #[command(subcommand)]
         cmd: OrdersCmd,
     },
+    /// Índice de riesgo
+    Risk {
+        #[command(subcommand)]
+        cmd: RiskCmd,
+    },
     Pause,
     Resume,
     Serve,
@@ -80,6 +85,16 @@ pub enum PaperCmd {
 pub enum CheckCmd {
     Iol,
     Telegram,
+}
+
+#[derive(Subcommand)]
+pub enum RiskCmd {
+    /// Acepta como movimiento real un posible cambio de ratio pendiente (se aplica en el
+    /// próximo control de riesgo del servicio)
+    Accept {
+        /// Símbolo con el posible cambio de ratio (el que muestra el aviso o `moon status`)
+        symbol: String,
+    },
 }
 
 #[derive(Subcommand)]

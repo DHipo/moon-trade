@@ -239,14 +239,20 @@ fn resolve_accepts_a_unique_prefix_of_six_or_more_characters() {
     let order = unknown_order(Some(dec!(9700)));
     let store = store_with(&order);
     let short = moon_app::engine::short_id(order.id);
-    assert_eq!(find_order_id(&store, &short).expect("short"), order.id);
-    assert_eq!(find_order_id(&store, &short[..6]).expect("six"), order.id);
     assert_eq!(
-        find_order_id(&store, &order.id.to_string().to_uppercase()).expect("full"),
+        find_order_id(&store, ExecMode::Live, &short).expect("short"),
+        order.id
+    );
+    assert_eq!(
+        find_order_id(&store, ExecMode::Live, &short[..6]).expect("six"),
+        order.id
+    );
+    assert_eq!(
+        find_order_id(&store, ExecMode::Live, &order.id.to_string().to_uppercase()).expect("full"),
         order.id
     );
     // Too short.
-    let err = find_order_id(&store, &short[..5]).expect_err("short prefix");
+    let err = find_order_id(&store, ExecMode::Live, &short[..5]).expect_err("short prefix");
     assert!(err.to_string().contains("al menos 6"), "{err}");
     // Unknown prefix (valid hex, no order) and non-hex input.
     let other = if short.starts_with('0') {
@@ -254,9 +260,9 @@ fn resolve_accepts_a_unique_prefix_of_six_or_more_characters() {
     } else {
         "000000"
     };
-    let err = find_order_id(&store, other).expect_err("unknown");
+    let err = find_order_id(&store, ExecMode::Live, other).expect_err("unknown");
     assert!(err.to_string().contains("No existe"), "{err}");
-    let err = find_order_id(&store, "%%%%%%").expect_err("wildcards");
+    let err = find_order_id(&store, ExecMode::Live, "%%%%%%").expect_err("wildcards");
     assert!(err.to_string().contains("No existe"), "{err}");
 }
 
@@ -268,13 +274,13 @@ fn ambiguous_prefix_lists_the_candidates() {
     b.id = Uuid::parse_str("1a2b3c4d-5e6f-4a7b-8c9d-000000000002").expect("uuid");
     let mut store = store_with(&a);
     store.insert_order(&b).expect("insert");
-    let err = find_order_id(&store, "1a2b3c").expect_err("ambiguous");
+    let err = find_order_id(&store, ExecMode::Live, "1a2b3c").expect_err("ambiguous");
     let msg = err.to_string();
     assert!(msg.contains("ambiguo"), "{msg}");
     assert_eq!(msg.matches("AAA").count(), 2, "{msg}");
     // The full id still resolves.
     assert_eq!(
-        find_order_id(&store, &a.id.to_string()).expect("full"),
+        find_order_id(&store, ExecMode::Live, &a.id.to_string()).expect("full"),
         a.id
     );
 }
@@ -322,4 +328,28 @@ fn cli_parses_orders_list_and_prefix_resolve() {
         } => assert_eq!(order_id, "1a2b3c"),
         _ => panic!("expected orders resolve"),
     }
+}
+
+#[test]
+fn prefix_lookup_only_sees_orders_of_the_configured_mode() {
+    let mut paper = unknown_order(Some(dec!(9700)));
+    paper.mode = ExecMode::Paper;
+    let live = unknown_order(Some(dec!(9700)));
+    let mut store = store_with(&paper);
+    store.insert_order(&live).expect("insert");
+    let paper_short = moon_app::engine::short_id(paper.id);
+    let live_short = moon_app::engine::short_id(live.id);
+    // In live a paper order's prefix matches nothing.
+    let err = find_order_id(&store, ExecMode::Live, &paper_short).expect_err("paper hidden");
+    assert!(err.to_string().contains("No existe"), "{err}");
+    assert_eq!(
+        find_order_id(&store, ExecMode::Live, &live_short).expect("live"),
+        live.id
+    );
+    // And the other way round in paper mode.
+    assert_eq!(
+        find_order_id(&store, ExecMode::Paper, &paper_short).expect("paper"),
+        paper.id
+    );
+    assert!(find_order_id(&store, ExecMode::Paper, &live_short).is_err());
 }

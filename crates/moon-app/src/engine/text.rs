@@ -240,8 +240,24 @@ impl Engine {
             ),
             nav_line,
             breaker_line,
-            "Posiciones:".to_string(),
         ];
+        if let Some(d) = drawdown_state
+            .as_ref()
+            .filter(|d| !d.tripped && d.breaches > 0)
+        {
+            lines.push(format!(
+                "⚠️ Ruptura sin confirmar: {} de {} controles (si se confirma, el freno vende las posiciones de riesgo)",
+                d.breaches, self.cfg.risk.trip_confirmations
+            ));
+        }
+        if let Some(i) = &risk_index {
+            for sym in i.suspicions.keys() {
+                lines.push(format!(
+                    "⚠️ Posible cambio de ratio en {sym}: no se cuenta como caída hasta que IOL actualice la tenencia o lo aceptes con /aceptar {sym} (o `moon risk accept {sym}`)"
+                ));
+            }
+        }
+        lines.push("Posiciones:".to_string());
         for p in v.positions.iter().filter(|p| p.qty > Decimal::ZERO) {
             lines.push(format!(
                 "• {}: {} × {} = {} ({})",
